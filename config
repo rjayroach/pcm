@@ -1,0 +1,3 @@
+# cop configuration
+COP_BACKEND=op
+COP_CREDENTIALS_VAULT=Private
