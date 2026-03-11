@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cop — Credential Operations
+# pcm — Personal Credentials Manager
 #
-# A backend-agnostic credential manager. Reads COP_VAULT from the environment
+# A backend-agnostic credential manager. Reads PCM_VAULT from the environment
 # to determine which vault to operate on. Backend plugins provide the actual
 # implementation (1Password, Bitwarden, etc).
 #
 # Env vars:
-#   COP_VAULT              — vault to operate on (required for most commands)
-#   COP_BACKEND            — backend provider (default: op)
-#   COP_CREDENTIALS_VAULT  — vault storing SA tokens (default: Private)
+#   PCM_VAULT              — vault to operate on (required for most commands)
+#   PCM_BACKEND            — backend provider (default: op)
+#   PCM_CREDENTIALS_VAULT  — vault storing SA tokens (default: Private)
 
-COP_LIB_DIR="${HOME}/.local/lib/cop"
-COP_CONFIG="${HOME}/.config/cop/config"
-COP_DEBUG="${COP_DEBUG:-}"
+# Resolve install location (follow symlinks to find the repo)
+PCM_HOME="$(dirname "$(readlink -f "$0")")"
+PCM_CONFIG="${HOME}/.config/pcm/config"
+PCM_DEBUG="${PCM_DEBUG:-}"
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 _debug() {
-  [[ -n "$COP_DEBUG" ]] && echo "[cop] $*" >&2 || true
+  [[ -n "$PCM_DEBUG" ]] && echo "[pcm] $*" >&2 || true
 }
 
 _error() {
-  echo "cop: $*" >&2
+  echo "pcm: $*" >&2
 }
 
 _require_vault() {
-  if [[ -z "${COP_VAULT:-}" ]]; then
-    _error "COP_VAULT is not set — cd into a space directory or export COP_VAULT"
+  if [[ -z "${PCM_VAULT:-}" ]]; then
+    _error "PCM_VAULT is not set — cd into a space directory or export PCM_VAULT"
     exit 1
   fi
 }
@@ -40,27 +41,27 @@ _require_vault() {
 # ---------------------------------------------------------------------------
 
 # Load config file if present
-if [[ -f "$COP_CONFIG" ]]; then
-  _debug "Loading config from $COP_CONFIG"
-  source "$COP_CONFIG"
+if [[ -f "$PCM_CONFIG" ]]; then
+  _debug "Loading config from $PCM_CONFIG"
+  source "$PCM_CONFIG"
 fi
 
 # Resolve backend (env > config > default)
-COP_BACKEND="${COP_BACKEND:-op}"
-COP_CREDENTIALS_VAULT="${COP_CREDENTIALS_VAULT:-Private}"
+PCM_BACKEND="${PCM_BACKEND:-op}"
+PCM_CREDENTIALS_VAULT="${PCM_CREDENTIALS_VAULT:-Private}"
 
 # Load backend plugin
-_backend_file="${COP_LIB_DIR}/${COP_BACKEND}.sh"
+_backend_file="${PCM_HOME}/lib/${PCM_BACKEND}.sh"
 if [[ ! -f "$_backend_file" ]]; then
-  _error "Backend '${COP_BACKEND}' not found at ${_backend_file}"
+  _error "Backend '${PCM_BACKEND}' not found at ${_backend_file}"
   _error "Available backends:"
-  for f in "${COP_LIB_DIR}"/*.sh; do
+  for f in "${PCM_HOME}"/lib/*.sh; do
     [[ -f "$f" ]] && _error "  $(basename "$f" .sh)"
   done
   exit 1
 fi
 
-_debug "Loading backend: ${COP_BACKEND} from ${_backend_file}"
+_debug "Loading backend: ${PCM_BACKEND} from ${_backend_file}"
 source "$_backend_file"
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ source "$_backend_file"
 
 cmd_vault() {
   _require_vault
-  echo "$COP_VAULT"
+  echo "$PCM_VAULT"
 }
 
 cmd_env() {
@@ -77,23 +78,23 @@ cmd_env() {
   local var="${2:-}"
 
   if [[ -z "$ref" ]]; then
-    _error "Usage: cop env <service/field> [VAR_NAME]"
+    _error "Usage: pcm env <service/field> [VAR_NAME]"
     exit 1
   fi
 
   _require_vault
-  _debug "Reading ${ref} from vault ${COP_VAULT}"
+  _debug "Reading ${ref} from vault ${PCM_VAULT}"
 
   local value
-  value=$(_cop_read "$COP_VAULT" "$ref")
+  value=$(_pcm_read "$PCM_VAULT" "$ref")
   if [[ -z "$value" ]]; then
-    _error "Failed to read ${ref} from vault ${COP_VAULT}"
+    _error "Failed to read ${ref} from vault ${PCM_VAULT}"
     exit 1
   fi
 
   if [[ -n "$var" ]]; then
     # When called with VAR_NAME, output an export statement
-    # Caller can eval: eval "$(cop env github/token GH_TOKEN)"
+    # Caller can eval: eval "$(pcm env github/token GH_TOKEN)"
     echo "export ${var}='${value}'"
   else
     echo "$value"
@@ -102,16 +103,16 @@ cmd_env() {
 
 cmd_list() {
   _require_vault
-  _debug "Listing items in vault ${COP_VAULT}"
-  _cop_list "$COP_VAULT"
+  _debug "Listing items in vault ${PCM_VAULT}"
+  _pcm_list "$PCM_VAULT"
 }
 
 cmd_token() {
   _require_vault
-  _debug "Fetching SA token for vault ${COP_VAULT}"
+  _debug "Fetching SA token for vault ${PCM_VAULT}"
 
   local token=""
-  local keychain_key="cop-sa-token-${COP_VAULT}"
+  local keychain_key="pcm-sa-token-${PCM_VAULT}"
 
   # Try macOS Keychain first
   if command -v security >/dev/null 2>&1; then
@@ -124,9 +125,9 @@ cmd_token() {
   fi
 
   # Fetch from backend and cache
-  token=$(_cop_sa_token "$COP_VAULT" "$COP_CREDENTIALS_VAULT")
+  token=$(_pcm_sa_token "$PCM_VAULT" "$PCM_CREDENTIALS_VAULT")
   if [[ -z "$token" ]]; then
-    _error "Failed to read SA token for vault '${COP_VAULT}'"
+    _error "Failed to read SA token for vault '${PCM_VAULT}'"
     exit 1
   fi
 
@@ -139,11 +140,21 @@ cmd_token() {
   echo "$token"
 }
 
+cmd_update() {
+  _debug "Updating pcm from ${PCM_HOME}"
+  if [[ ! -d "${PCM_HOME}/.git" ]]; then
+    _error "PCM_HOME (${PCM_HOME}) is not a git repo — cannot update"
+    exit 1
+  fi
+  git -C "$PCM_HOME" pull
+  echo "pcm updated"
+}
+
 cmd_help() {
   cat <<'EOF'
-cop — Credential Operations
+pcm — Personal Credentials Manager
 
-Usage: cop [--debug] <command> [args...]
+Usage: pcm [--debug] <command> [args...]
 
 Commands:
   vault                         Show current vault name
@@ -151,13 +162,14 @@ Commands:
   env <service/field> VAR_NAME  Output export statement for eval
   list                          List items in current vault (JSON)
   token                         Get SA token for current vault (keychain cached)
+  update                        Update pcm (git pull)
   help                          Show this help
 
 Environment:
-  COP_VAULT              Vault to operate on (set via mise/.mise.toml)
-  COP_BACKEND            Backend provider (default: op)
-  COP_CREDENTIALS_VAULT  Vault storing SA tokens (default: Private)
-  COP_DEBUG              Enable debug output (set to any value)
+  PCM_VAULT              Vault to operate on (set via mise/.mise.toml)
+  PCM_BACKEND            Backend provider (default: op)
+  PCM_CREDENTIALS_VAULT  Vault storing SA tokens (default: Private)
+  PCM_DEBUG              Enable debug output (set to any value)
 EOF
 }
 
@@ -167,7 +179,7 @@ EOF
 
 # Handle --debug flag
 if [[ "${1:-}" == "--debug" ]]; then
-  COP_DEBUG=1
+  PCM_DEBUG=1
   shift
 fi
 
@@ -175,11 +187,12 @@ command="${1:-help}"
 shift 2>/dev/null || true
 
 case "$command" in
-  vault) cmd_vault ;;
-  env)   cmd_env "$@" ;;
-  list)  cmd_list ;;
-  token) cmd_token ;;
-  help)  cmd_help ;;
+  vault)  cmd_vault ;;
+  env)    cmd_env "$@" ;;
+  list)   cmd_list ;;
+  token)  cmd_token ;;
+  update) cmd_update ;;
+  help)   cmd_help ;;
   *)
     _error "Unknown command: $command"
     cmd_help
