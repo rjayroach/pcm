@@ -35,3 +35,15 @@ _pcm_sa_token() {
   local vault="$1" credentials_vault="$2"
   op read "op://${credentials_vault}/${vault}-sa-token/credential" 2>/dev/null
 }
+
+# Return the env exports needed for a remote host to use this backend.
+# Called by `pcm remote-env` — the output is injected into the SSH command.
+_pcm_remote_env() {
+  local vault="$1" credentials_vault="$2"
+  local token
+  token=$(_pcm_sa_token "$vault" "$credentials_vault") || return 1
+  if [[ -z "$token" ]]; then
+    return 1
+  fi
+  echo "export OP_SERVICE_ACCOUNT_TOKEN='${token}'"
+}

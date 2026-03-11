@@ -17,13 +17,13 @@ pcm() {
         return 1
       fi
 
-      local vault token
+      local vault remote_env
 
       vault=$(command pcm vault) || return 1
-      token=$(command pcm token) || return 1
+      remote_env=$(command pcm remote-env) || return 1
 
       ssh -t "$@" "
-        export OP_SERVICE_ACCOUNT_TOKEN='${token}'
+        ${remote_env}
         export PCM_VAULT='${vault}'
         exec \$SHELL -l
       "

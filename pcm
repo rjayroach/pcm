@@ -140,6 +140,20 @@ cmd_token() {
   echo "$token"
 }
 
+cmd_remote_env() {
+  _require_vault
+  _debug "Generating remote env for vault ${PCM_VAULT} (backend: ${PCM_BACKEND})"
+
+  local env_output
+  env_output=$(_pcm_remote_env "$PCM_VAULT" "$PCM_CREDENTIALS_VAULT")
+  if [[ -z "$env_output" ]]; then
+    _error "Backend '${PCM_BACKEND}' failed to generate remote env for vault '${PCM_VAULT}'"
+    exit 1
+  fi
+
+  echo "$env_output"
+}
+
 cmd_update() {
   _debug "Updating pcm from ${PCM_HOME}"
   if [[ ! -d "${PCM_HOME}/.git" ]]; then
@@ -162,6 +176,7 @@ Commands:
   env <service/field> VAR_NAME  Output export statement for eval
   list                          List items in current vault (JSON)
   token                         Get SA token for current vault (keychain cached)
+  remote-env                    Output backend-specific env exports for remote hosts
   update                        Update pcm (git pull)
   help                          Show this help
 
@@ -187,12 +202,13 @@ command="${1:-help}"
 shift 2>/dev/null || true
 
 case "$command" in
-  vault)  cmd_vault ;;
-  env)    cmd_env "$@" ;;
-  list)   cmd_list ;;
-  token)  cmd_token ;;
-  update) cmd_update ;;
-  help)   cmd_help ;;
+  vault)      cmd_vault ;;
+  env)        cmd_env "$@" ;;
+  list)       cmd_list ;;
+  token)      cmd_token ;;
+  remote-env) cmd_remote_env ;;
+  update)     cmd_update ;;
+  help)       cmd_help ;;
   *)
     _error "Unknown command: $command"
     cmd_help
