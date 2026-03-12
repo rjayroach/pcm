@@ -325,14 +325,19 @@ cmd_vault_create() {
 
 cmd_get_help() {
   cat <<'EOF'
-pcm get — Read a credential from a vault
+pcm get — Read credentials from a vault
 
-Usage: pcm get [flags] <service/field> [VAR_NAME]
+Usage: pcm get [flags] <ref> [VAR_NAME]
+       pcm get <tool>
+
+  ref = service/field      Read a single credential
+  tool = name (no slash)   Read all credentials for a tool (from tools.yml)
 
   Without VAR_NAME: echoes the value
   With VAR_NAME:    outputs export VAR_NAME='value' (eval-able)
+  Tool mode:        always outputs export lines for all env vars
 
-Vault selection:
+Vault selection (ref mode only — tool mode uses the tool's configured vault):
   (default)           Read from workspace vault
   -w                  Read from workspace vault (explicit)
   -p                  Read from personal vault
@@ -341,11 +346,52 @@ Vault selection:
                       or a literal vault name)
 
 Examples:
-  pcm get github/token                    # from workspace vault
-  pcm get -p github/token                 # from personal vault
+  pcm get github/token                    # single credential from workspace
+  pcm get -p github/token                 # single credential from personal
   pcm get -p github/token GH_TOKEN        # output: export GH_TOKEN='...'
   pcm get --from lgat postgres/url-dev     # from a specific vault
+  pcm get gh                              # all credentials for gh tool
+  eval $(pcm get aws)                     # load aws credentials into shell
 EOF
+}
+
+_get_tool_env() {
+  local tool_name="$1"
+
+  if [[ ! -f "$PCM_TOOLS" ]]; then
+    return 1
+  fi
+
+  local tool_vault
+  tool_vault=$(_yq ".${tool_name}.vault" "$PCM_TOOLS")
+  if [[ -z "$tool_vault" ]]; then
+    return 1
+  fi
+
+  local vault
+  vault=$(_resolve_vault "$tool_vault")
+
+  _debug "Loading tool '${tool_name}' from vault ${vault} (role: ${tool_vault})"
+
+  local env_keys
+  env_keys=$(_yq ".${tool_name}.environment | keys | .[]" "$PCM_TOOLS")
+
+  local had_error=0
+  while IFS= read -r var_name; do
+    [[ -z "$var_name" ]] && continue
+    local ref value
+    ref=$(_yq ".${tool_name}.environment.${var_name}" "$PCM_TOOLS")
+    _debug "  ${var_name} <- ${ref}"
+    value=$(_pcm_read "$vault" "$ref")
+    if [[ -z "$value" ]]; then
+      _error "Failed to read ${ref} from vault ${vault} (tool: ${tool_name}, var: ${var_name})"
+      had_error=1
+      continue
+    fi
+    echo "export ${var_name}='${value}'"
+  done <<< "$env_keys"
+
+  return $had_error
 }
 
 cmd_get() {
@@ -382,6 +428,17 @@ cmd_get() {
     exit 1
   fi
 
+  # Tool mode: no slash means look up a tool in tools.yml
+  if [[ "$ref" != */* ]]; then
+    if _get_tool_env "$ref"; then
+      return 0
+    else
+      _error "'${ref}' is not a tool in ${PCM_TOOLS} and not a valid ref (expected item/field)"
+      exit 1
+    fi
+  fi
+
+  # Ref mode: service/field
   local vault
   vault=$(_resolve_vault "$from")
 
@@ -659,7 +716,8 @@ pcm — Personal Credentials Manager
 Usage: pcm [--debug] <command> [args...]
 
 Commands:
-  get [flags] <ref> [VAR]       Read a credential from a vault
+  get [flags] <ref> [VAR]       Read a single credential (ref = item/field)
+  get <tool>                    Read all credentials for a tool (from tools.yml)
     -w                            from workspace vault
     -p                            from personal vault
     -c                            from credentials vault

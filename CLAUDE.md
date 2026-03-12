@@ -104,7 +104,8 @@ The `vault` field accepts role names (workspace, personal, credentials) or liter
 ## CLI Reference
 
 ```
-pcm get [flags] <ref> [VAR]       Read a credential
+pcm get [flags] <ref> [VAR]       Read a single credential (ref = item/field)
+pcm get <tool>                    Read all credentials for a tool (from tools.yml)
   -w                                from workspace vault (default)
   -p                                from personal vault
   -c                                from credentials vault
