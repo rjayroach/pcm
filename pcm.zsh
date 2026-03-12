@@ -28,7 +28,7 @@ pcm() {
       [[ -n "$debug_flag" ]] && echo "[pcm ssh] Resolving vault..." >&2
       vault=$(command pcm $debug_flag vault show)
       if [[ $? -ne 0 || -z "$vault" ]]; then
-        echo "pcm ssh: failed to resolve vault (is PCM_ACTIVE_VAULT set?)" >&2
+        echo "pcm ssh: failed to resolve vault (is PCM_VAULT_ROLE_WORKSPACE set?)" >&2
         return 1
       fi
       [[ -n "$debug_flag" ]] && echo "[pcm ssh] Vault: $vault" >&2
@@ -43,7 +43,7 @@ pcm() {
 
       local remote_cmd="
         ${remote_env}
-        export PCM_ACTIVE_VAULT='${vault}'
+        export PCM_VAULT_ROLE_WORKSPACE='${vault}'
         exec \$SHELL -l
       "
       [[ -n "$debug_flag" ]] && echo "[pcm ssh] Remote command: $remote_cmd" >&2

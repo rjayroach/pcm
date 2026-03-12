@@ -6,12 +6,12 @@ set -euo pipefail
 # WHAT THIS SCRIPT DOES:
 #   1. Clones the pcm repo to ~/.local/share/pcm (or pulls if already present)
 #   2. Symlinks ~/.local/bin/pcm to the repo's pcm script
-#   3. Copies default config to ~/.config/pcm/config (only on first install)
+#   3. Copies default vaults.yml to ~/.config/pcm/ (only on first install)
 #
 # FILES CREATED:
 #   ~/.local/share/pcm/              - git clone of rjayroach/pcm
-#   ~/.local/bin/pcm                 - symlink → ~/.local/share/pcm/pcm
-#   ~/.config/pcm/config             - default config (first install only)
+#   ~/.local/bin/pcm                 - symlink -> ~/.local/share/pcm/pcm
+#   ~/.config/pcm/vaults.yml         - vault configuration (first install only)
 #
 # SHELL INTEGRATION:
 #   Source pcm.zsh from your shell config to enable the ssh wrapper:
@@ -22,7 +22,7 @@ PCM_REPO_URL=https://github.com/rjayroach/pcm.git
 PCM_DATA_DIR="${HOME}/.local/share/pcm"
 PCM_BIN_LINK="${HOME}/.local/bin/pcm"
 PCM_CONFIG_DIR="${HOME}/.config/pcm"
-PCM_CONFIG_FILE="${PCM_CONFIG_DIR}/config"
+PCM_VAULTS_FILE="${PCM_CONFIG_DIR}/vaults.yml"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -59,21 +59,22 @@ if [[ -L "$PCM_BIN_LINK" ]]; then
   rm "$PCM_BIN_LINK"
 fi
 ln -s "$PCM_DATA_DIR/pcm" "$PCM_BIN_LINK"
-echo "Linked $PCM_BIN_LINK → $PCM_DATA_DIR/pcm"
+echo "Linked $PCM_BIN_LINK -> $PCM_DATA_DIR/pcm"
 
-# Copy default config (only if not present)
-if [[ ! -f "$PCM_CONFIG_FILE" ]]; then
+# Copy default vaults config (only if not present)
+if [[ ! -f "$PCM_VAULTS_FILE" ]]; then
   mkdir -p "$PCM_CONFIG_DIR"
-  cp "$PCM_DATA_DIR/config" "$PCM_CONFIG_FILE"
-  echo "Created $PCM_CONFIG_FILE"
+  cp "$PCM_DATA_DIR/vaults.yml" "$PCM_VAULTS_FILE"
+  echo "Created $PCM_VAULTS_FILE"
 else
-  echo "Config already exists at $PCM_CONFIG_FILE — skipping"
+  echo "Vaults config already exists at $PCM_VAULTS_FILE — skipping"
 fi
 
 echo ""
 echo -e "${GREEN}pcm installed successfully${NC}"
 echo ""
-echo "Shell integration (optional):"
-echo "  Add to your shell config:  source ~/.local/share/pcm/pcm.zsh"
+echo "Next steps:"
+echo "  1. Edit ~/.config/pcm/vaults.yml to configure your vaults"
+echo "  2. Source the shell wrapper:  source ~/.local/share/pcm/pcm.zsh"
 echo ""
 echo "Run 'pcm help' to get started."

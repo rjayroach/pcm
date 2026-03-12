@@ -1,0 +1,6 @@
+defaults:
+  vault_backend: op
+
+vaults: {}
+
+vault_roles: {}

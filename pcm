@@ -6,15 +6,16 @@ set -euo pipefail
 # A backend-agnostic credential manager. Backend plugins provide the actual
 # implementation (1Password, Bitwarden, etc).
 #
-# Env vars:
-#   PCM_ACTIVE_VAULT       — vault for current space/context (set via mise)
-#   PCM_IDENTITY_VAULT     — personal vault (set in config)
-#   PCM_CREDENTIALS_VAULT  — vault storing SA tokens (default: Private)
-#   PCM_BACKEND            — backend provider (default: op)
+# Configuration: ~/.config/pcm/vaults.yml
+#
+# Env var overrides (take precedence over vaults.yml):
+#   PCM_VAULT_ROLE_WORKSPACE    — vault for current context (e.g. set via mise)
+#   PCM_VAULT_ROLE_PERSONAL     — personal vault
+#   PCM_VAULT_ROLE_CREDENTIALS  — vault storing SA tokens
 
 # Resolve install location (follow symlinks to find the repo)
 PCM_HOME="$(dirname "$(readlink -f "$0")")"
-PCM_CONFIG="${HOME}/.config/pcm/config"
+PCM_VAULTS="${HOME}/.config/pcm/vaults.yml"
 PCM_TOOLS="${HOME}/.config/pcm/tools.yml"
 PCM_DEBUG="${PCM_DEBUG:-}"
 
@@ -30,130 +31,152 @@ _error() {
   echo "pcm: $*" >&2
 }
 
-_require_active_vault() {
-  if [[ -z "${PCM_ACTIVE_VAULT:-}" ]]; then
-    _error "PCM_ACTIVE_VAULT is not set"
+_yq() {
+  local result
+  result=$(yq "$@" 2>/dev/null) || true
+  [[ "$result" == "null" ]] && result=""
+  echo "$result"
+}
+
+_show_role() {
+  local label="$1" value="$2" env_var="$3"
+  if [[ -n "$value" ]]; then
+    printf "%-13s%s\n" "${label}:" "$value"
+  else
+    printf "%-13s(not set) export %s=<vault_name>\n" "${label}:" "$env_var"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Load vaults configuration
+# ---------------------------------------------------------------------------
+
+PCM_DEFAULT_BACKEND="op"
+
+if [[ -f "$PCM_VAULTS" ]]; then
+  _debug "Loading vaults from $PCM_VAULTS"
+
+  local_default=$(_yq '.defaults.vault_backend' "$PCM_VAULTS")
+  [[ -n "$local_default" ]] && PCM_DEFAULT_BACKEND="$local_default"
+
+  local_workspace=$(_yq '.vault_roles.workspace' "$PCM_VAULTS")
+  local_personal=$(_yq '.vault_roles.personal' "$PCM_VAULTS")
+  local_credentials=$(_yq '.vault_roles.credentials' "$PCM_VAULTS")
+
+  PCM_VAULT_ROLE_WORKSPACE="${PCM_VAULT_ROLE_WORKSPACE:-$local_workspace}"
+  PCM_VAULT_ROLE_PERSONAL="${PCM_VAULT_ROLE_PERSONAL:-$local_personal}"
+  PCM_VAULT_ROLE_CREDENTIALS="${PCM_VAULT_ROLE_CREDENTIALS:-$local_credentials}"
+else
+  _debug "No vaults.yml found at $PCM_VAULTS"
+  PCM_VAULT_ROLE_WORKSPACE="${PCM_VAULT_ROLE_WORKSPACE:-}"
+  PCM_VAULT_ROLE_PERSONAL="${PCM_VAULT_ROLE_PERSONAL:-}"
+  PCM_VAULT_ROLE_CREDENTIALS="${PCM_VAULT_ROLE_CREDENTIALS:-}"
+fi
+
+# ---------------------------------------------------------------------------
+# Backend loading
+# ---------------------------------------------------------------------------
+
+_backend_for_vault() {
+  local vault_name="$1"
+  if [[ -f "$PCM_VAULTS" ]]; then
+    local vb
+    vb=$(_yq ".vaults.${vault_name}.backend" "$PCM_VAULTS")
+    if [[ -n "$vb" ]]; then
+      echo "$vb"
+      return
+    fi
+  fi
+  echo "$PCM_DEFAULT_BACKEND"
+}
+
+_PCM_LOADED_BACKEND=""
+
+_load_backend() {
+  local backend="$1"
+  if [[ "$backend" == "$_PCM_LOADED_BACKEND" ]]; then
+    return 0
+  fi
+
+  local backend_file="${PCM_HOME}/lib/${backend}.sh"
+  if [[ ! -f "$backend_file" ]]; then
+    _error "Backend '${backend}' not found at ${backend_file}"
+    _error "Available backends:"
+    for f in "${PCM_HOME}"/lib/*.sh; do
+      [[ -f "$f" ]] && _error "  $(basename "$f" .sh)"
+    done
+    exit 1
+  fi
+
+  _debug "Loading backend: ${backend} from ${backend_file}"
+  source "$backend_file"
+  _PCM_LOADED_BACKEND="$backend"
+}
+
+_load_backend "$PCM_DEFAULT_BACKEND"
+
+_with_backend() {
+  local vault_name="$1"
+  local backend
+  backend=$(_backend_for_vault "$vault_name")
+  _load_backend "$backend"
+  echo "$vault_name"
+}
+
+# ---------------------------------------------------------------------------
+# Vault role resolution
+# ---------------------------------------------------------------------------
+
+_require_workspace_vault() {
+  if [[ -z "${PCM_VAULT_ROLE_WORKSPACE:-}" ]]; then
+    _error "PCM_VAULT_ROLE_WORKSPACE is not set"
     exit 1
   fi
 }
 
-_require_identity_vault() {
-  if [[ -z "${PCM_IDENTITY_VAULT:-}" ]]; then
-    _error "PCM_IDENTITY_VAULT is not set — configure it in ${PCM_CONFIG}"
+_require_personal_vault() {
+  if [[ -z "${PCM_VAULT_ROLE_PERSONAL:-}" ]]; then
+    _error "PCM_VAULT_ROLE_PERSONAL is not set — configure vault_roles.personal in ${PCM_VAULTS}"
     exit 1
   fi
 }
 
 _require_credentials_vault() {
-  if [[ -z "${PCM_CREDENTIALS_VAULT:-}" ]]; then
-    _error "PCM_CREDENTIALS_VAULT is not set — configure it in ${PCM_CONFIG}"
+  if [[ -z "${PCM_VAULT_ROLE_CREDENTIALS:-}" ]]; then
+    _error "PCM_VAULT_ROLE_CREDENTIALS is not set — configure vault_roles.credentials in ${PCM_VAULTS}"
     exit 1
   fi
 }
 
 _resolve_vault() {
   local from="$1"
+  local vault_name=""
+
   case "$from" in
-    identity)
-      _require_identity_vault
-      echo "$PCM_IDENTITY_VAULT"
+    personal)
+      _require_personal_vault
+      vault_name="$PCM_VAULT_ROLE_PERSONAL"
       ;;
-    active)
-      _require_active_vault
-      echo "$PCM_ACTIVE_VAULT"
+    workspace)
+      _require_workspace_vault
+      vault_name="$PCM_VAULT_ROLE_WORKSPACE"
       ;;
     credentials)
       _require_credentials_vault
-      echo "$PCM_CREDENTIALS_VAULT"
+      vault_name="$PCM_VAULT_ROLE_CREDENTIALS"
       ;;
     *)
       if [[ -z "$from" ]]; then
-        _require_active_vault
-        echo "$PCM_ACTIVE_VAULT"
+        _require_workspace_vault
+        vault_name="$PCM_VAULT_ROLE_WORKSPACE"
       else
-        echo "$from"
+        vault_name="$from"
       fi
       ;;
   esac
+
+  _with_backend "$vault_name"
 }
-
-# ---------------------------------------------------------------------------
-# YAML parser (minimal, for tools.yml)
-# ---------------------------------------------------------------------------
-
-_parse_tools_yaml() {
-  local file="$1"
-  local current_tool="" current_section=""
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-
-    if [[ "$line" =~ ^([a-zA-Z0-9_-]+):$ ]]; then
-      current_tool="${BASH_REMATCH[1]}"
-      current_section=""
-      continue
-    fi
-
-    if [[ -n "$current_tool" && "$line" =~ ^[[:space:]]{2}([a-zA-Z0-9_-]+):[[:space:]]*(.*)$ ]]; then
-      local key="${BASH_REMATCH[1]}"
-      local val="${BASH_REMATCH[2]}"
-      if [[ -n "$val" ]]; then
-        echo "${current_tool}.${key}=${val}"
-        current_section=""
-      else
-        current_section="$key"
-      fi
-      continue
-    fi
-
-    if [[ -n "$current_tool" && -n "$current_section" && "$line" =~ ^[[:space:]]{4,}([a-zA-Z0-9_-]+):[[:space:]]*(.+)$ ]]; then
-      local key="${BASH_REMATCH[1]}"
-      local val="${BASH_REMATCH[2]}"
-      echo "${current_tool}.${current_section}.${key}=${val}"
-      continue
-    fi
-  done < "$file"
-}
-
-_tools_get() {
-  local tool="$1" key="$2" data="$3"
-  echo "$data" | grep "^${tool}\.${key}=" | head -1 | cut -d= -f2-
-}
-
-_tools_env_mappings() {
-  local tool="$1" data="$2"
-  echo "$data" | grep "^${tool}\.environment\." | sed "s/^${tool}\.environment\.//"
-}
-
-_tools_names() {
-  local data="$1"
-  echo "$data" | grep -o '^[^.]*' | sort -u
-}
-
-# ---------------------------------------------------------------------------
-# Load config and backend
-# ---------------------------------------------------------------------------
-
-if [[ -f "$PCM_CONFIG" ]]; then
-  _debug "Loading config from $PCM_CONFIG"
-  source "$PCM_CONFIG"
-fi
-
-PCM_BACKEND="${PCM_BACKEND:-op}"
-PCM_CREDENTIALS_VAULT="${PCM_CREDENTIALS_VAULT:-Private}"
-
-_backend_file="${PCM_HOME}/lib/${PCM_BACKEND}.sh"
-if [[ ! -f "$_backend_file" ]]; then
-  _error "Backend '${PCM_BACKEND}' not found at ${_backend_file}"
-  _error "Available backends:"
-  for f in "${PCM_HOME}"/lib/*.sh; do
-    [[ -f "$f" ]] && _error "  $(basename "$f" .sh)"
-  done
-  exit 1
-fi
-
-_debug "Loading backend: ${PCM_BACKEND} from ${_backend_file}"
-source "$_backend_file"
 
 # ---------------------------------------------------------------------------
 # pcm vault
@@ -166,8 +189,8 @@ pcm vault — Vault management
 Usage: pcm vault <subcommand> [args...]
 
 Subcommands:
-  list                          List configured vaults
-  show [name]                   Show backend details for a vault
+  list                          List configured vaults and roles
+  show [name|role]              Show backend details for a vault
   create <n>                 Create vault, service account, and store SA token
     [--permissions PERMS]         SA permissions (default: read_items)
 EOF
@@ -191,30 +214,30 @@ cmd_vault() {
 }
 
 cmd_vault_list() {
-  echo "active:      ${PCM_ACTIVE_VAULT:-(not set)}"
-  echo "identity:    ${PCM_IDENTITY_VAULT:-(not set)}"
-  echo "credentials: ${PCM_CREDENTIALS_VAULT:-(not set)}"
+  _show_role "workspace"   "${PCM_VAULT_ROLE_WORKSPACE:-}"    "PCM_VAULT_ROLE_WORKSPACE"
+  _show_role "personal"    "${PCM_VAULT_ROLE_PERSONAL:-}"     "PCM_VAULT_ROLE_PERSONAL"
+  _show_role "credentials" "${PCM_VAULT_ROLE_CREDENTIALS:-}"  "PCM_VAULT_ROLE_CREDENTIALS"
 }
 
 cmd_vault_show() {
-  local name="${1:-${PCM_ACTIVE_VAULT:-}}"
+  local arg="${1:-workspace}"
 
-  if [[ -z "$name" ]]; then
-    _error "Usage: pcm vault show <n>  (or set PCM_ACTIVE_VAULT)"
-    exit 1
-  fi
+  local name
+  name=$(_resolve_vault "$arg")
 
-  # Determine which pcm role(s) this vault has
   local roles=""
-  [[ "${PCM_ACTIVE_VAULT:-}" == "$name" ]] && roles="active"
-  [[ "${PCM_IDENTITY_VAULT:-}" == "$name" ]] && roles="${roles:+${roles}, }identity"
-  [[ "${PCM_CREDENTIALS_VAULT:-}" == "$name" ]] && roles="${roles:+${roles}, }credentials"
+  [[ "${PCM_VAULT_ROLE_WORKSPACE:-}" == "$name" ]] && roles="workspace"
+  [[ "${PCM_VAULT_ROLE_PERSONAL:-}" == "$name" ]] && roles="${roles:+${roles}, }personal"
+  [[ "${PCM_VAULT_ROLE_CREDENTIALS:-}" == "$name" ]] && roles="${roles:+${roles}, }credentials"
+
+  local backend
+  backend=$(_backend_for_vault "$name")
 
   echo "Name:    ${name}"
   echo "Role:    ${roles:-(none)}"
-  echo "Backend: ${PCM_BACKEND}"
+  echo "Backend: ${backend}"
 
-  # Query backend for details
+  _load_backend "$backend"
   _debug "Fetching vault info for ${name}"
   local info
   info=$(_pcm_vault_info "$name" 2>/dev/null) || true
@@ -224,7 +247,6 @@ cmd_vault_show() {
     return 0
   fi
 
-  # Extract fields from JSON (backend-specific, but jq is safe to assume with op)
   if command -v jq >/dev/null 2>&1; then
     local vault_id vault_items vault_created
     vault_id=$(echo "$info" | jq -r '.id // empty')
@@ -235,7 +257,6 @@ cmd_vault_show() {
     [[ -n "$vault_items" ]] && echo "Items:   ${vault_items}"
     [[ -n "$vault_created" ]] && echo "Created: ${vault_created}"
   else
-    # No jq — dump raw
     echo "Info:    ${info}"
   fi
 }
@@ -267,6 +288,8 @@ cmd_vault_create() {
     exit 1
   fi
 
+  _with_backend "$name" >/dev/null
+
   if _pcm_vault_exists "$name"; then
     echo "Vault '$name' already exists"
     return 0
@@ -289,10 +312,11 @@ cmd_vault_create() {
   fi
   echo "Created service account: ${name}-sa"
 
-  _debug "Storing SA token in ${PCM_CREDENTIALS_VAULT} as ${name}-sa-token"
-  _pcm_create_item "$PCM_CREDENTIALS_VAULT" "${name}-sa-token" "password" \
+  _require_credentials_vault
+  _debug "Storing SA token in ${PCM_VAULT_ROLE_CREDENTIALS} as ${name}-sa-token"
+  _pcm_create_item "$PCM_VAULT_ROLE_CREDENTIALS" "${name}-sa-token" "password" \
     "password=${token}"
-  echo "Stored SA token: ${name}-sa-token in ${PCM_CREDENTIALS_VAULT}"
+  echo "Stored SA token: ${name}-sa-token in ${PCM_VAULT_ROLE_CREDENTIALS}"
 }
 
 # ---------------------------------------------------------------------------
@@ -309,26 +333,28 @@ Usage: pcm get [flags] <service/field> [VAR_NAME]
   With VAR_NAME:    outputs export VAR_NAME='value' (eval-able)
 
 Vault selection:
-  (default)         Read from PCM_ACTIVE_VAULT
-  -i                Read from PCM_IDENTITY_VAULT
-  -c                Read from PCM_CREDENTIALS_VAULT
-  --from <vault>    Read from a named vault (identity, active, credentials,
-                    or a literal vault name)
+  (default)           Read from workspace vault
+  -w                  Read from workspace vault (explicit)
+  -p                  Read from personal vault
+  -c                  Read from credentials vault
+  --from <vault>      Read from a named vault (workspace, personal, credentials,
+                      or a literal vault name)
 
 Examples:
-  pcm get github/token                    # from active vault
-  pcm get -i github/token                 # from identity vault
-  pcm get -i github/token GH_TOKEN        # output: export GH_TOKEN='...'
+  pcm get github/token                    # from workspace vault
+  pcm get -p github/token                 # from personal vault
+  pcm get -p github/token GH_TOKEN        # output: export GH_TOKEN='...'
   pcm get --from lgat postgres/url-dev     # from a specific vault
 EOF
 }
 
 cmd_get() {
-  local from="active" ref="" var=""
+  local from="workspace" ref="" var=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -i)     from="identity"; shift ;;
+      -w)     from="workspace"; shift ;;
+      -p)     from="personal"; shift ;;
       -c)     from="credentials"; shift ;;
       --from) from="$2"; shift 2 ;;
       -*)
@@ -380,9 +406,11 @@ cmd_get() {
 # ---------------------------------------------------------------------------
 
 cmd_list() {
-  _require_active_vault
-  _debug "Listing items in vault ${PCM_ACTIVE_VAULT}"
-  _pcm_list "$PCM_ACTIVE_VAULT"
+  _require_workspace_vault
+  local vault
+  vault=$(_with_backend "$PCM_VAULT_ROLE_WORKSPACE")
+  _debug "Listing items in vault ${vault}"
+  _pcm_list "$vault"
 }
 
 # ---------------------------------------------------------------------------
@@ -396,7 +424,7 @@ pcm token — SA token management
 Usage: pcm token [subcommand]
 
 Subcommands:
-  (default)         Get SA token for current active vault (keychain cached)
+  (default)         Get SA token for workspace vault (keychain cached)
   clear [vault]     Clear cached SA token from keychain
   list              List cached SA tokens in keychain
 EOF
@@ -419,11 +447,11 @@ cmd_token() {
 }
 
 cmd_token_get() {
-  _require_active_vault
-  _debug "Fetching SA token for vault ${PCM_ACTIVE_VAULT}"
+  _require_workspace_vault
+  _debug "Fetching SA token for vault ${PCM_VAULT_ROLE_WORKSPACE}"
 
   local token=""
-  local keychain_key="pcm-sa-token-${PCM_ACTIVE_VAULT}"
+  local keychain_key="pcm-sa-token-${PCM_VAULT_ROLE_WORKSPACE}"
 
   if command -v security >/dev/null 2>&1; then
     token=$(security find-generic-password -a "$USER" -s "$keychain_key" -w 2>/dev/null || true)
@@ -434,9 +462,12 @@ cmd_token_get() {
     fi
   fi
 
-  token=$(_pcm_sa_token "$PCM_ACTIVE_VAULT" "$PCM_CREDENTIALS_VAULT")
+  _require_credentials_vault
+  local creds_vault
+  creds_vault=$(_with_backend "$PCM_VAULT_ROLE_CREDENTIALS")
+  token=$(_pcm_sa_token "$PCM_VAULT_ROLE_WORKSPACE" "$creds_vault")
   if [[ -z "$token" ]]; then
-    _error "Failed to read SA token for vault '${PCM_ACTIVE_VAULT}'"
+    _error "Failed to read SA token for vault '${PCM_VAULT_ROLE_WORKSPACE}'"
     exit 1
   fi
 
@@ -449,10 +480,10 @@ cmd_token_get() {
 }
 
 cmd_token_clear() {
-  local vault="${1:-${PCM_ACTIVE_VAULT:-}}"
+  local vault="${1:-${PCM_VAULT_ROLE_WORKSPACE:-}}"
 
   if [[ -z "$vault" ]]; then
-    _error "Usage: pcm token clear [vault]  (or set PCM_ACTIVE_VAULT)"
+    _error "Usage: pcm token clear [vault]  (or set PCM_VAULT_ROLE_WORKSPACE)"
     exit 1
   fi
 
@@ -519,10 +550,8 @@ cmd_tools_list() {
     exit 1
   fi
 
-  local parsed
-  parsed=$(_parse_tools_yaml "$PCM_TOOLS")
   local tools
-  tools=$(_tools_names "$parsed")
+  tools=$(_yq 'keys | .[]' "$PCM_TOOLS")
 
   if [[ -z "$tools" ]]; then
     echo "No tools configured"
@@ -531,16 +560,17 @@ cmd_tools_list() {
 
   while IFS= read -r tool; do
     local vault
-    vault=$(_tools_get "$tool" "vault" "$parsed")
-    vault="${vault:-active}"
+    vault=$(_yq ".${tool}.vault // \"workspace\"" "$PCM_TOOLS")
     echo "${tool}  (vault: ${vault})"
 
-    local mappings
-    mappings=$(_tools_env_mappings "$tool" "$parsed")
-    while IFS='=' read -r var_name ref; do
+    local env_keys
+    env_keys=$(_yq ".${tool}.environment | keys | .[]" "$PCM_TOOLS")
+    while IFS= read -r var_name; do
       [[ -z "$var_name" ]] && continue
+      local ref
+      ref=$(_yq ".${tool}.environment.${var_name}" "$PCM_TOOLS")
       echo "  ${var_name} <- ${ref}"
-    done <<< "$mappings"
+    done <<< "$env_keys"
   done <<< "$tools"
 }
 
@@ -557,11 +587,8 @@ cmd_tools_show() {
     exit 1
   fi
 
-  local parsed
-  parsed=$(_parse_tools_yaml "$PCM_TOOLS")
-
   local vault
-  vault=$(_tools_get "$tool_name" "vault" "$parsed")
+  vault=$(_yq ".${tool_name}.vault" "$PCM_TOOLS")
 
   if [[ -z "$vault" ]]; then
     _error "Tool '${tool_name}' not found in ${PCM_TOOLS}"
@@ -569,18 +596,20 @@ cmd_tools_show() {
   fi
 
   local resolved_vault
-  resolved_vault=$(_resolve_vault "$vault") 2>/dev/null || resolved_vault="(unset)"
+  resolved_vault=$(_resolve_vault "$vault" 2>/dev/null) || resolved_vault="(unset)"
 
   echo "Tool: ${tool_name}"
   echo "Vault: ${vault} (${resolved_vault})"
   echo "Environment:"
 
-  local mappings
-  mappings=$(_tools_env_mappings "$tool_name" "$parsed")
-  while IFS='=' read -r var_name ref; do
+  local env_keys
+  env_keys=$(_yq ".${tool_name}.environment | keys | .[]" "$PCM_TOOLS")
+  while IFS= read -r var_name; do
     [[ -z "$var_name" ]] && continue
+    local ref
+    ref=$(_yq ".${tool_name}.environment.${var_name}" "$PCM_TOOLS")
     echo "  ${var_name} <- ${ref}"
-  done <<< "$mappings"
+  done <<< "$env_keys"
 }
 
 # ---------------------------------------------------------------------------
@@ -588,13 +617,17 @@ cmd_tools_show() {
 # ---------------------------------------------------------------------------
 
 cmd_remote_env() {
-  _require_active_vault
-  _debug "Generating remote env for vault ${PCM_ACTIVE_VAULT} (backend: ${PCM_BACKEND})"
+  _require_workspace_vault
 
+  local vault
+  vault=$(_with_backend "$PCM_VAULT_ROLE_WORKSPACE")
+  _debug "Generating remote env for vault ${vault} (backend: $(_backend_for_vault "$vault"))"
+
+  _require_credentials_vault
   local env_output
-  env_output=$(_pcm_remote_env "$PCM_ACTIVE_VAULT" "$PCM_CREDENTIALS_VAULT")
+  env_output=$(_pcm_remote_env "$vault" "$PCM_VAULT_ROLE_CREDENTIALS")
   if [[ -z "$env_output" ]]; then
-    _error "Backend '${PCM_BACKEND}' failed to generate remote env for vault '${PCM_ACTIVE_VAULT}'"
+    _error "Failed to generate remote env for vault '${vault}'"
     exit 1
   fi
 
@@ -627,23 +660,27 @@ Usage: pcm [--debug] <command> [args...]
 
 Commands:
   get [flags] <ref> [VAR]       Read a credential from a vault
-    -i                            from identity vault
+    -w                            from workspace vault
+    -p                            from personal vault
     -c                            from credentials vault
     --from <vault>                from a named vault
   vault                         Vault management (list, show, create)
-  list                          List items in active vault (JSON)
+  list                          List items in workspace vault (JSON)
   token                         SA token management (get, clear, list)
   tools                         Tool wrapper configuration (list, show)
   remote-env                    Output backend-specific env exports for remote hosts
   update                        Update pcm (git pull)
   help                          Show this help
 
-Environment:
-  PCM_ACTIVE_VAULT       Vault for current context (e.g. set via mise)
-  PCM_IDENTITY_VAULT     Personal vault (set in config)
-  PCM_CREDENTIALS_VAULT  Vault storing SA tokens (default: Private)
-  PCM_BACKEND            Backend provider (default: op)
-  PCM_DEBUG              Enable debug output (set to any value)
+Configuration:
+  ~/.config/pcm/vaults.yml        Vault backends, roles, and registry
+  ~/.config/pcm/tools.yml         Tool wrapper credential mappings
+
+Env var overrides:
+  PCM_VAULT_ROLE_WORKSPACE    Override workspace vault role
+  PCM_VAULT_ROLE_PERSONAL     Override personal vault role
+  PCM_VAULT_ROLE_CREDENTIALS  Override credentials vault role
+  PCM_DEBUG                   Enable debug output (set to any value)
 
 Run 'pcm <command>' for subcommand help.
 EOF
