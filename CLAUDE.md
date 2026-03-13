@@ -19,15 +19,75 @@ PCM has zero runtime dependencies beyond its backend CLI tool and `yq` for YAML 
     └── op.sh                  # 1Password backend plugin
 ```
 
-## User Config Files
+## Configuration
+
+PCM uses a unified `.pcm.yml` schema. All config files share the same format and are merged in order (later wins):
+
+1. `~/.config/pcm/conf.d/*.yml` — global fragments (alphabetical)
+2. `.pcm.yml` / `pcm.yml` files walking up from `$PWD` — outermost first, innermost last
+
+Both `.pcm.yml` (hidden) and `pcm.yml` (visible) are supported in every directory. If both exist in the same directory, the hidden file takes precedence.
+
+Legacy files (`~/.config/pcm/vaults.yml`, `~/.config/pcm/tools.yml`) are supported and auto-transformed during loading, but conf.d takes precedence when present.
+
+### Unified Schema
+
+```yaml
+# Any .pcm.yml can contain any combination of these keys
+
+defaults:
+  backend: op                    # default backend for all vaults
+
+vaults:                          # vault registry
+  my-vault:
+  another-vault:
+    backend: bw                  # per-vault backend override
+
+roles:                           # vault role assignments
+  workspace: my-vault
+  personal: my-vault
+  credentials: another-vault
+
+settings:                        # credential resolution settings
+  prefix: ${PCM_SITE}            # template string, env vars expanded
+  separator: "-"                 # between prefix and credential name (default: -)
+
+credentials:                     # credential mappings
+  gh:
+    vault: personal
+    fields:
+      GH_TOKEN: token
+  unifi:
+    vault: workspace
+    fields:
+      UNIFI_API_KEY: credential
+      UNIFI_API: hostname
+```
+
+### Config Files
 
 ```
-~/.config/pcm/
-├── vaults.yml                 # vault backends, roles, and registry
-└── tools.yml                  # tool wrapper credential mappings
+~/.config/pcm/conf.d/           # global config fragments
+├── vaults.yml                   # vault registry, roles, backend defaults
+├── gh.yml                       # github credential mapping
+└── aws.yml                      # aws credential mapping
+
+~/spaces/myproject/.pcm.yml      # project-local settings + credentials
 ```
 
-These are user-editable, not managed by pcm. The installer seeds `vaults.yml` on first install only.
+### Prefix System
+
+When `settings.prefix` is declared, credential item names are prefixed:
+
+- `settings.prefix: ${PCM_SITE}` with `PCM_SITE=singapore` and `separator: "-"`
+- Credential `unifi`, field `credential` → reads item `singapore-unifi`, field `credential`
+- Full `op read` ref: `op://vault/singapore-unifi/credential`
+
+If prefix is declared, all env vars in the template must be set or PCM hard-fails. If prefix is not declared, item names are used as-is (backward compatible).
+
+Prefix applies in both modes:
+- **Ref mode:** `pcm get unifi/credential` — if `unifi` is a configured credential, prefix is applied
+- **Credential mode:** `pcm get unifi` — outputs export lines for all fields, with prefix
 
 ## Architecture
 
@@ -39,17 +99,15 @@ PCM organizes vaults into three roles:
 - **personal** — your personal vault (identity-level credentials like GitHub tokens)
 - **credentials** — where SA tokens are stored (meta-credentials vault)
 
-Roles are configured in `vaults.yml` under `vault_roles:` and overridden by env vars:
+Roles are configured in `.pcm.yml` under `roles:` and overridden by env vars:
 
 | Role | YAML key | Env var override |
 |------|----------|-----------------|
-| workspace | `vault_roles.workspace` | `PCM_VAULT_ROLE_WORKSPACE` |
-| personal | `vault_roles.personal` | `PCM_VAULT_ROLE_PERSONAL` |
-| credentials | `vault_roles.credentials` | `PCM_VAULT_ROLE_CREDENTIALS` |
+| workspace | `roles.workspace` | `PCM_VAULT_ROLE_WORKSPACE` |
+| personal | `roles.personal` | `PCM_VAULT_ROLE_PERSONAL` |
+| credentials | `roles.credentials` | `PCM_VAULT_ROLE_CREDENTIALS` |
 
-Resolution order: env var → `vault_roles:` in YAML → error.
-
-The workspace role is typically set dynamically by mise based on directory context. The personal and credentials roles are typically static in `vaults.yml`.
+Resolution order: env var → merged config → error.
 
 ### Backend System
 
@@ -58,54 +116,26 @@ Backends are shell scripts in `lib/` that implement a standard interface:
 ```bash
 _pcm_read <vault> <ref>                          # read a secret
 _pcm_list <vault>                                # list items (JSON)
-_pcm_vault_exists <name>                         # check if vault exists
-_pcm_vault_info <name>                           # get vault details (JSON)
-_pcm_create_vault <name>                         # create a vault
-_pcm_create_sa <name> <vault> [permissions]      # create SA, return token
+_pcm_vault_exists <n>                         # check if vault exists
+_pcm_vault_info <n>                           # get vault details (JSON)
+_pcm_create_vault <n>                         # create a vault
+_pcm_create_sa <n> <vault> [permissions]      # create SA, return token
 _pcm_create_item <vault> <title> <category> ...  # store a credential
 _pcm_sa_token <vault> <credentials_vault>        # read SA token
 _pcm_remote_env <vault> <credentials_vault>      # output env exports for SSH
 ```
 
-The default backend is set in `vaults.yml` under `defaults.vault_backend`. Individual vaults can override the backend:
-
-```yaml
-vaults:
-  my-bw-vault:
-    backend: bw
-```
-
-The backend is loaded on-demand when a vault is accessed. Adding a backend = dropping a `lib/<name>.sh` file.
+The default backend is set under `defaults.backend`. Individual vaults can override the backend. Adding a backend = dropping a `lib/<n>.sh` file.
 
 ### Shell Wrapper (pcm.zsh)
 
 The `pcm.zsh` file defines a shell function that wraps the `pcm` script. This is needed for `pcm ssh` which must run `ssh` in the current shell context. All other commands delegate to the script via `command pcm`.
 
-Sourced from zsh config (e.g. via a symlink in `~/.config/zsh/`).
-
-### Tools Configuration
-
-`~/.config/pcm/tools.yml` declares how CLI tools map to vault credentials:
-
-```yaml
-gh:
-  vault: personal
-  environment:
-    GH_TOKEN: github/token
-aws:
-  vault: workspace
-  environment:
-    AWS_ACCESS_KEY_ID: aws/access-key-id
-    AWS_SECRET_ACCESS_KEY: aws/secret-access-key
-```
-
-The `vault` field accepts role names (workspace, personal, credentials) or literal vault names. The `environment` section maps env var names to credential paths within the vault.
-
 ## CLI Reference
 
 ```
-pcm get [flags] <ref> [VAR]       Read a single credential (ref = item/field)
-pcm get <tool>                    Read all credentials for a tool (from tools.yml)
+pcm get [flags] <ref> [VAR]       Read a single field (ref = item/field)
+pcm get <credential>              Read all fields for a credential (export lines)
   -w                                from workspace vault (default)
   -p                                from personal vault
   -c                                from credentials vault
@@ -113,17 +143,19 @@ pcm get <tool>                    Read all credentials for a tool (from tools.ym
 
 pcm vault list                    Show configured vault roles
 pcm vault show [name|role]        Show backend details for a vault
-pcm vault create <name>           Create vault + SA + store token
+pcm vault create <n>           Create vault + SA + store token
   [--permissions PERMS]
+
+pcm credentials list              List configured credentials and field mappings
+pcm credentials show <n>       Show details for a specific credential
+
+pcm config                        Show effective merged configuration
 
 pcm list                          List items in workspace vault (JSON)
 
 pcm token [get]                   Get SA token (keychain cached)
 pcm token clear [vault]           Clear cached SA token
 pcm token list                    List cached SA tokens
-
-pcm tools list                    List configured tool wrappers
-pcm tools show <tool>             Show tool details
 
 pcm ssh <host> [ssh-args...]      SSH with credential forwarding (via pcm.zsh)
 pcm remote-env                    Output backend env exports for remote hosts
@@ -142,12 +174,6 @@ All commands support `--debug` as the first argument for verbose output.
 curl -fsSL https://raw.githubusercontent.com/rjayroach/pcm/main/install.sh | bash
 ```
 
-This clones the repo to `~/.local/share/pcm`, symlinks `~/.local/bin/pcm`, and seeds `~/.config/pcm/vaults.yml`.
-
-### Via ppm
-
-The ppm package (`pde-ppm/packages/pcm`) runs the install script and symlinks `pcm.zsh` into `~/.config/zsh/`.
-
 ### Dependencies
 
 - `yq` — YAML parser (required)
@@ -155,21 +181,14 @@ The ppm package (`pde-ppm/packages/pcm`) runs the install script and symlinks `p
 - Backend CLI tool (e.g. `op` for 1Password)
 - `security` CLI — macOS Keychain (optional, for SA token caching)
 
-## Design Principles
-
-- **Backend-agnostic** — PCM delegates all credential operations to backend plugins. The main script has zero knowledge of 1Password, Bitwarden, etc.
-- **Config is optional** — env vars can drive everything. `vaults.yml` provides defaults; `tools.yml` is additive. PCM works with zero config files if all roles are set via env vars.
-- **No custom YAML parsing** — uses `yq` for all YAML operations.
-- **Vault roles, not vault names** — commands reference roles (workspace, personal, credentials) which resolve to vault names. This decouples the CLI from specific vault naming.
-- **Debug with `--debug`** — all commands respect `PCM_DEBUG` for verbose output including backend stderr.
-
 ## Naming Conventions
 
 ### 1Password items
 
 - SA tokens: `{vault}-sa-token` in the credentials vault, field name `password`
 - Service accounts: `{vault}-sa`
-- Credentials: `{service}/{field}` (e.g. `github/token`, `aws/access-key-id`)
+- Credentials: `{item}/{field}` (e.g. `github/token`, `unifi/credential`)
+- With prefix: `{prefix}-{item}/{field}` (e.g. `singapore-unifi/credential`)
 
 ### Keychain entries
 

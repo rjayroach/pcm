@@ -6,18 +6,26 @@ set -euo pipefail
 # A backend-agnostic credential manager. Backend plugins provide the actual
 # implementation (1Password, Bitwarden, etc).
 #
-# Configuration: ~/.config/pcm/vaults.yml
+# Configuration (unified .pcm.yml schema, merged in order):
+#   1. ~/.config/pcm/conf.d/*.yml    — global fragments (alphabetical)
+#   2. Walk up from $PWD: .pcm.yml   — project/space-local overrides
 #
-# Env var overrides (take precedence over vaults.yml):
+# Env var overrides (take precedence over config):
 #   PCM_VAULT_ROLE_WORKSPACE    — vault for current context (e.g. set via mise)
 #   PCM_VAULT_ROLE_PERSONAL     — personal vault
 #   PCM_VAULT_ROLE_CREDENTIALS  — vault storing SA tokens
 
 # Resolve install location (follow symlinks to find the repo)
 PCM_HOME="$(dirname "$(readlink -f "$0")")"
-PCM_VAULTS="${HOME}/.config/pcm/vaults.yml"
-PCM_TOOLS="${HOME}/.config/pcm/tools.yml"
+PCM_CONF_DIR="${HOME}/.config/pcm/conf.d"
+
+# Parse --debug early so config loading can use it
 PCM_DEBUG="${PCM_DEBUG:-}"
+if [[ "${1:-}" == "--debug" ]]; then
+  PCM_DEBUG=1
+  shift
+fi
+_PCM_ARGS=("$@")
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -48,30 +56,181 @@ _show_role() {
 }
 
 # ---------------------------------------------------------------------------
-# Load vaults configuration
+# Unified config loading
+# ---------------------------------------------------------------------------
+# PCM uses a merged config model. All config files share the same schema:
+#
+#   defaults:
+#     backend: op
+#   vaults:
+#     my-vault:
+#   roles:
+#     personal: my-vault
+#   settings:
+#     prefix: ${PCM_SITE}
+#     separator: "-"
+#   credentials:
+#     gh:
+#       vault: personal
+#       fields:
+#         GH_TOKEN: token
+#
+# Files are merged in order (later wins):
+#   1. ~/.config/pcm/conf.d/*.yml (alphabetical)
+#   2. .pcm.yml files walking up from $PWD (outermost first, innermost last)
+#
+# Additionally, legacy files are supported during migration:
+#   - ~/.config/pcm/vaults.yml  (old vault config)
+#   - ~/.config/pcm/tools.yml   (old tool config)
+
+# Merged config is built as a temp file that yq can query
+_PCM_CONFIG=""
+
+_build_config() {
+  local tmpfile
+  tmpfile=$(mktemp /tmp/pcm-config.XXXXXX.yml)
+  echo "{}" > "$tmpfile"
+
+  # --- Legacy support: migrate old vaults.yml schema on the fly ---
+  local legacy_vaults="${HOME}/.config/pcm/vaults.yml"
+  if [[ -f "$legacy_vaults" ]]; then
+    _debug "Loading legacy vaults.yml from $legacy_vaults"
+    # Transform old schema to new:
+    #   defaults.vault_backend → defaults.backend
+    #   vault_roles → roles
+    local legacy_tmp
+    legacy_tmp=$(mktemp /tmp/pcm-legacy.XXXXXX.yml)
+    yq '
+      {
+        "defaults": {"backend": (.defaults.vault_backend // "op")},
+        "vaults": .vaults,
+        "roles": .vault_roles
+      } | with_entries(select(.value != null))
+    ' "$legacy_vaults" > "$legacy_tmp" 2>/dev/null || true
+    yq -i '. *d load("'"$legacy_tmp"'")' "$tmpfile" 2>/dev/null || true
+    rm -f "$legacy_tmp"
+  fi
+
+  # --- Legacy support: migrate old tools.yml schema on the fly ---
+  local legacy_tools="${HOME}/.config/pcm/tools.yml"
+  if [[ -f "$legacy_tools" ]] && [[ ! -d "$PCM_CONF_DIR" || -z "$(ls -A "$PCM_CONF_DIR" 2>/dev/null)" ]]; then
+    _debug "Loading legacy tools.yml from $legacy_tools"
+    # Transform: top-level keys with .vault and .environment → credentials with .vault and .fields
+    local tools_tmp
+    tools_tmp=$(mktemp /tmp/pcm-tools.XXXXXX.yml)
+    yq '{"credentials": (to_entries | map(.value = {"vault": .value.vault, "fields": .value.environment}) | from_entries)}' \
+      "$legacy_tools" > "$tools_tmp" 2>/dev/null || true
+    yq -i '. *d load("'"$tools_tmp"'")' "$tmpfile" 2>/dev/null || true
+    rm -f "$tools_tmp"
+  fi
+
+  # --- Phase 1: Load global conf.d fragments ---
+  if [[ -d "$PCM_CONF_DIR" ]]; then
+    for f in "$PCM_CONF_DIR"/*.yml; do
+      [[ -f "$f" ]] || continue
+      _debug "Loading conf.d: $f"
+      yq -i '. *d load("'"$f"'")' "$tmpfile" 2>/dev/null || true
+    done
+  fi
+
+  # --- Phase 2: Walk up from $PWD collecting .pcm.yml / pcm.yml files ---
+  # Supports both hidden (.pcm.yml) and non-hidden (pcm.yml), like mise.
+  # If both exist in the same directory, only .pcm.yml is used.
+  local -a pcm_files=()
+  local dir="$PWD"
+
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "${dir}/.pcm.yml" ]]; then
+      pcm_files+=("${dir}/.pcm.yml")
+    elif [[ -f "${dir}/pcm.yml" ]]; then
+      pcm_files+=("${dir}/pcm.yml")
+    fi
+    dir="$(dirname "$dir")"
+  done
+
+  # Merge outermost first so innermost wins
+  local i
+  for (( i=${#pcm_files[@]}-1; i>=0; i-- )); do
+    _debug "Loading project config: ${pcm_files[$i]}"
+    yq -i '. *d load("'"${pcm_files[$i]}"'")' "$tmpfile" 2>/dev/null || true
+  done
+
+  _PCM_CONFIG="$tmpfile"
+  _debug "Effective config: $tmpfile"
+}
+
+_build_config
+
+_cfg() {
+  _yq "$@" "$_PCM_CONFIG"
+}
+
+# Cleanup temp config on exit
+trap 'rm -f "$_PCM_CONFIG"' EXIT
+
+# ---------------------------------------------------------------------------
+# Read config values
 # ---------------------------------------------------------------------------
 
-PCM_DEFAULT_BACKEND="op"
+PCM_DEFAULT_BACKEND=$(_cfg '.defaults.backend // "op"')
 
-if [[ -f "$PCM_VAULTS" ]]; then
-  _debug "Loading vaults from $PCM_VAULTS"
+_cfg_workspace=$(_cfg '.roles.workspace')
+_cfg_personal=$(_cfg '.roles.personal')
+_cfg_credentials=$(_cfg '.roles.credentials')
 
-  local_default=$(_yq '.defaults.vault_backend' "$PCM_VAULTS")
-  [[ -n "$local_default" ]] && PCM_DEFAULT_BACKEND="$local_default"
+PCM_VAULT_ROLE_WORKSPACE="${PCM_VAULT_ROLE_WORKSPACE:-$_cfg_workspace}"
+PCM_VAULT_ROLE_PERSONAL="${PCM_VAULT_ROLE_PERSONAL:-$_cfg_personal}"
+PCM_VAULT_ROLE_CREDENTIALS="${PCM_VAULT_ROLE_CREDENTIALS:-$_cfg_credentials}"
 
-  local_workspace=$(_yq '.vault_roles.workspace' "$PCM_VAULTS")
-  local_personal=$(_yq '.vault_roles.personal' "$PCM_VAULTS")
-  local_credentials=$(_yq '.vault_roles.credentials' "$PCM_VAULTS")
+# Settings (from merged config — project-local overrides global)
+_PCM_SETTINGS_PREFIX=$(_cfg '.settings.prefix')
+_PCM_SETTINGS_SEPARATOR=$(_cfg '.settings.separator // "-"')
 
-  PCM_VAULT_ROLE_WORKSPACE="${PCM_VAULT_ROLE_WORKSPACE:-$local_workspace}"
-  PCM_VAULT_ROLE_PERSONAL="${PCM_VAULT_ROLE_PERSONAL:-$local_personal}"
-  PCM_VAULT_ROLE_CREDENTIALS="${PCM_VAULT_ROLE_CREDENTIALS:-$local_credentials}"
-else
-  _debug "No vaults.yml found at $PCM_VAULTS"
-  PCM_VAULT_ROLE_WORKSPACE="${PCM_VAULT_ROLE_WORKSPACE:-}"
-  PCM_VAULT_ROLE_PERSONAL="${PCM_VAULT_ROLE_PERSONAL:-}"
-  PCM_VAULT_ROLE_CREDENTIALS="${PCM_VAULT_ROLE_CREDENTIALS:-}"
-fi
+# ---------------------------------------------------------------------------
+# Prefix resolution
+# ---------------------------------------------------------------------------
+
+# Resolve a prefix template string by expanding ${VAR} references.
+# If settings.prefix is declared, all referenced env vars must be set.
+# If settings.prefix is not declared, returns empty string.
+_resolve_prefix() {
+  if [[ -z "$_PCM_SETTINGS_PREFIX" ]]; then
+    echo ""
+    return 0
+  fi
+
+  local prefix="$_PCM_SETTINGS_PREFIX"
+  local resolved="$prefix"
+
+  # Extract all ${VAR} references and validate they're set
+  local var_names
+  var_names=$(echo "$prefix" | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' | sed 's/\${\(.*\)}/\1/' | sort -u)
+
+  while IFS= read -r var; do
+    [[ -z "$var" ]] && continue
+    local val="${!var:-}"
+    if [[ -z "$val" ]]; then
+      _error "Prefix variable ${var} is not set (required by settings.prefix: ${prefix})"
+      exit 1
+    fi
+    resolved="${resolved//\$\{${var}\}/${val}}"
+  done <<< "$var_names"
+
+  echo "$resolved"
+}
+
+# Build the full item ref: [prefix-]<credential_name>/<field_name>
+_build_ref() {
+  local cred_name="$1" field_name="$2"
+  local prefix
+  prefix=$(_resolve_prefix)
+
+  if [[ -n "$prefix" ]]; then
+    echo "${prefix}${_PCM_SETTINGS_SEPARATOR}${cred_name}/${field_name}"
+  else
+    echo "${cred_name}/${field_name}"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Backend loading
@@ -79,13 +238,11 @@ fi
 
 _backend_for_vault() {
   local vault_name="$1"
-  if [[ -f "$PCM_VAULTS" ]]; then
-    local vb
-    vb=$(_yq ".vaults.${vault_name}.backend" "$PCM_VAULTS")
-    if [[ -n "$vb" ]]; then
-      echo "$vb"
-      return
-    fi
+  local vb
+  vb=$(_cfg ".vaults.${vault_name}.backend")
+  if [[ -n "$vb" ]]; then
+    echo "$vb"
+    return
   fi
   echo "$PCM_DEFAULT_BACKEND"
 }
@@ -136,14 +293,14 @@ _require_workspace_vault() {
 
 _require_personal_vault() {
   if [[ -z "${PCM_VAULT_ROLE_PERSONAL:-}" ]]; then
-    _error "PCM_VAULT_ROLE_PERSONAL is not set — configure vault_roles.personal in ${PCM_VAULTS}"
+    _error "PCM_VAULT_ROLE_PERSONAL is not set — configure roles.personal in a .pcm.yml"
     exit 1
   fi
 }
 
 _require_credentials_vault() {
   if [[ -z "${PCM_VAULT_ROLE_CREDENTIALS:-}" ]]; then
-    _error "PCM_VAULT_ROLE_CREDENTIALS is not set — configure vault_roles.credentials in ${PCM_VAULTS}"
+    _error "PCM_VAULT_ROLE_CREDENTIALS is not set — configure roles.credentials in a .pcm.yml"
     exit 1
   fi
 }
@@ -191,7 +348,7 @@ Usage: pcm vault <subcommand> [args...]
 Subcommands:
   list                          List configured vaults and roles
   show [name|role]              Show backend details for a vault
-  create <n>                 Create vault, service account, and store SA token
+  create <name>                 Create vault, service account, and store SA token
     [--permissions PERMS]         SA permissions (default: read_items)
 EOF
 }
@@ -269,7 +426,7 @@ cmd_vault_create() {
       --permissions) permissions="$2"; shift 2 ;;
       -*)
         _error "Unknown flag: $1"
-        _error "Usage: pcm vault create <n> [--permissions PERMS]"
+        _error "Usage: pcm vault create <name> [--permissions PERMS]"
         exit 1
         ;;
       *)
@@ -284,7 +441,7 @@ cmd_vault_create() {
   done
 
   if [[ -z "$name" ]]; then
-    _error "Usage: pcm vault create <n> [--permissions PERMS]"
+    _error "Usage: pcm vault create <name> [--permissions PERMS]"
     exit 1
   fi
 
@@ -328,68 +485,68 @@ cmd_get_help() {
 pcm get — Read credentials from a vault
 
 Usage: pcm get [flags] <ref> [VAR_NAME]
-       pcm get <tool>
+       pcm get <credential>
 
-  ref = service/field      Read a single credential
-  tool = name (no slash)   Read all credentials for a tool (from tools.yml)
+  ref = item/field         Read a single field value
+                             If item matches a configured credential, prefix is applied
+                             and vault is resolved from config
+  credential = name        Read all fields for a credential (from .pcm.yml)
+    (no slash)               Outputs export lines for all env vars
 
   Without VAR_NAME: echoes the value
   With VAR_NAME:    outputs export VAR_NAME='value' (eval-able)
-  Tool mode:        always outputs export lines for all env vars
+  Credential mode:  always outputs export lines for all env vars
 
-Vault selection (ref mode only — tool mode uses the tool's configured vault):
+Vault selection (ref mode only — credential mode uses configured vault):
   (default)           Read from workspace vault
   -w                  Read from workspace vault (explicit)
   -p                  Read from personal vault
   -c                  Read from credentials vault
-  --from <vault>      Read from a named vault (workspace, personal, credentials,
-                      or a literal vault name)
+  --from <vault>      Read from a named vault or role
 
 Examples:
-  pcm get github/token                    # single credential from workspace
-  pcm get -p github/token                 # single credential from personal
+  pcm get unifi/credential                # direct ref from workspace (no prefix)
+  pcm get -p github/token                 # direct ref from personal vault
   pcm get -p github/token GH_TOKEN        # output: export GH_TOKEN='...'
-  pcm get --from lgat postgres/url-dev     # from a specific vault
-  pcm get gh                              # all credentials for gh tool
+  pcm get --from lgat postgres/url-dev    # from a specific vault
+  pcm get gh                              # all fields for gh credential
+  pcm get unifi                           # all fields for unifi (with prefix)
   eval $(pcm get aws)                     # load aws credentials into shell
 EOF
 }
 
-_get_tool_env() {
-  local tool_name="$1"
+_get_credential_env() {
+  local cred_name="$1"
 
-  if [[ ! -f "$PCM_TOOLS" ]]; then
-    return 1
-  fi
-
-  local tool_vault
-  tool_vault=$(_yq ".${tool_name}.vault" "$PCM_TOOLS")
-  if [[ -z "$tool_vault" ]]; then
+  local cred_vault
+  cred_vault=$(_cfg ".credentials.${cred_name}.vault")
+  if [[ -z "$cred_vault" ]]; then
     return 1
   fi
 
   local vault
-  vault=$(_resolve_vault "$tool_vault")
+  vault=$(_resolve_vault "$cred_vault")
 
-  _debug "Loading tool '${tool_name}' from vault ${vault} (role: ${tool_vault})"
+  _debug "Loading credential '${cred_name}' from vault ${vault} (role: ${cred_vault})"
 
-  local env_keys
-  env_keys=$(_yq ".${tool_name}.environment | keys | .[]" "$PCM_TOOLS")
+  local field_keys
+  field_keys=$(_cfg ".credentials.${cred_name}.fields | keys | .[]")
 
   local had_error=0
   while IFS= read -r var_name; do
     [[ -z "$var_name" ]] && continue
-    local ref value
-    ref=$(_yq ".${tool_name}.environment.${var_name}" "$PCM_TOOLS")
+    local field_name ref value
+    field_name=$(_cfg ".credentials.${cred_name}.fields.${var_name}")
+    ref=$(_build_ref "$cred_name" "$field_name")
     _debug "  ${var_name} <- ${ref}"
     value=$(_pcm_read "$vault" "$ref")
     if [[ -z "$value" ]]; then
-      _error "Failed to read ${ref} from vault ${vault} (tool: ${tool_name}, var: ${var_name})"
+      _error "Failed to read ${ref} from vault ${vault} (credential: ${cred_name}, var: ${var_name})"
       had_error=1
       continue
     fi
     echo "export ${var_name}='${value}'"
-  done <<< "$env_keys"
+  done <<< "$field_keys"
 
   return $had_error
 }
@@ -428,21 +585,34 @@ cmd_get() {
     exit 1
   fi
 
-  # Tool mode: no slash means look up a tool in tools.yml
+  # Credential mode: no slash means look up in credentials config
   if [[ "$ref" != */* ]]; then
-    if _get_tool_env "$ref"; then
+    if _get_credential_env "$ref"; then
       return 0
     else
-      _error "'${ref}' is not a tool in ${PCM_TOOLS} and not a valid ref (expected item/field)"
+      _error "'${ref}' is not a configured credential and not a valid ref (expected item/field)"
       exit 1
     fi
   fi
 
-  # Ref mode: service/field
+  # Ref mode: item/field
+  # If the item name matches a configured credential, apply prefix and use its vault
+  local item_name="${ref%%/*}"
+  local field_name="${ref#*/}"
   local vault
-  vault=$(_resolve_vault "$from")
 
-  _debug "Reading ${ref} from vault ${vault} (source: ${from})"
+  local cred_vault
+  cred_vault=$(_cfg ".credentials.${item_name}.vault")
+  if [[ -n "$cred_vault" ]]; then
+    # Known credential — apply prefix and use configured vault
+    ref=$(_build_ref "$item_name" "$field_name")
+    vault=$(_resolve_vault "$cred_vault")
+    _debug "Reading ${ref} from vault ${vault} (credential: ${item_name}, field: ${field_name})"
+  else
+    # Unknown credential — use ref as-is with specified vault
+    vault=$(_resolve_vault "$from")
+    _debug "Reading ${ref} from vault ${vault} (source: ${from})"
+  fi
 
   local value
   value=$(_pcm_read "$vault" "$ref")
@@ -568,105 +738,169 @@ cmd_token_list() {
 }
 
 # ---------------------------------------------------------------------------
-# pcm tools
+# pcm credentials (replaces pcm tools)
 # ---------------------------------------------------------------------------
 
-cmd_tools_help() {
+cmd_credentials_help() {
   cat <<'EOF'
-pcm tools — Tool wrapper configuration
+pcm credentials — Credential configuration
 
-Usage: pcm tools <subcommand>
+Usage: pcm credentials <subcommand>
 
 Subcommands:
-  list              List configured tools and their credential mappings
-  show <tool>       Show details for a specific tool
+  list              List configured credentials and their field mappings
+  show <name>       Show details for a specific credential
 
-Config: ~/.config/pcm/tools.yml
+Config loaded from: ~/.config/pcm/conf.d/*.yml and .pcm.yml (walked up from $PWD)
 EOF
 }
 
-cmd_tools() {
+cmd_credentials() {
   local subcmd="${1:-}"
   shift 2>/dev/null || true
 
   case "$subcmd" in
-    list) cmd_tools_list ;;
-    show) cmd_tools_show "$@" ;;
-    "")   cmd_tools_help ;;
+    list) cmd_credentials_list ;;
+    show) cmd_credentials_show "$@" ;;
+    "")   cmd_credentials_help ;;
     *)
-      _error "Unknown tools subcommand: $subcmd"
-      cmd_tools_help
+      _error "Unknown credentials subcommand: $subcmd"
+      cmd_credentials_help
       exit 1
       ;;
   esac
 }
 
-cmd_tools_list() {
-  if [[ ! -f "$PCM_TOOLS" ]]; then
-    _error "No tools configured — create ${PCM_TOOLS}"
-    exit 1
-  fi
+cmd_credentials_list() {
+  local creds
+  creds=$(_cfg '.credentials | keys | .[]')
 
-  local tools
-  tools=$(_yq 'keys | .[]' "$PCM_TOOLS")
-
-  if [[ -z "$tools" ]]; then
-    echo "No tools configured"
+  if [[ -z "$creds" ]]; then
+    echo "No credentials configured"
     return 0
   fi
 
-  while IFS= read -r tool; do
-    local vault
-    vault=$(_yq ".${tool}.vault // \"workspace\"" "$PCM_TOOLS")
-    echo "${tool}  (vault: ${vault})"
+  local prefix
+  prefix=$(_resolve_prefix 2>/dev/null) || prefix=""
 
-    local env_keys
-    env_keys=$(_yq ".${tool}.environment | keys | .[]" "$PCM_TOOLS")
+  while IFS= read -r cred; do
+    local vault
+    vault=$(_cfg ".credentials.${cred}.vault // \"workspace\"")
+    if [[ -n "$prefix" ]]; then
+      echo "${cred}  (vault: ${vault}, item: ${prefix}${_PCM_SETTINGS_SEPARATOR}${cred})"
+    else
+      echo "${cred}  (vault: ${vault})"
+    fi
+
+    local field_keys
+    field_keys=$(_cfg ".credentials.${cred}.fields | keys | .[]")
     while IFS= read -r var_name; do
       [[ -z "$var_name" ]] && continue
-      local ref
-      ref=$(_yq ".${tool}.environment.${var_name}" "$PCM_TOOLS")
-      echo "  ${var_name} <- ${ref}"
-    done <<< "$env_keys"
-  done <<< "$tools"
+      local field_name
+      field_name=$(_cfg ".credentials.${cred}.fields.${var_name}")
+      echo "  ${var_name} <- ${field_name}"
+    done <<< "$field_keys"
+  done <<< "$creds"
 }
 
-cmd_tools_show() {
-  local tool_name="${1:-}"
+cmd_credentials_show() {
+  local cred_name="${1:-}"
 
-  if [[ -z "$tool_name" ]]; then
-    _error "Usage: pcm tools show <tool>"
-    exit 1
-  fi
-
-  if [[ ! -f "$PCM_TOOLS" ]]; then
-    _error "No tools configured — create ${PCM_TOOLS}"
+  if [[ -z "$cred_name" ]]; then
+    _error "Usage: pcm credentials show <name>"
     exit 1
   fi
 
   local vault
-  vault=$(_yq ".${tool_name}.vault" "$PCM_TOOLS")
+  vault=$(_cfg ".credentials.${cred_name}.vault")
 
   if [[ -z "$vault" ]]; then
-    _error "Tool '${tool_name}' not found in ${PCM_TOOLS}"
+    _error "Credential '${cred_name}' not found in config"
     exit 1
   fi
 
   local resolved_vault
   resolved_vault=$(_resolve_vault "$vault" 2>/dev/null) || resolved_vault="(unset)"
 
-  echo "Tool: ${tool_name}"
-  echo "Vault: ${vault} (${resolved_vault})"
-  echo "Environment:"
+  local prefix
+  prefix=$(_resolve_prefix 2>/dev/null) || prefix=""
 
-  local env_keys
-  env_keys=$(_yq ".${tool_name}.environment | keys | .[]" "$PCM_TOOLS")
+  echo "Credential: ${cred_name}"
+  echo "Vault:      ${vault} (${resolved_vault})"
+  if [[ -n "$prefix" ]]; then
+    echo "Item:       ${prefix}${_PCM_SETTINGS_SEPARATOR}${cred_name}"
+  else
+    echo "Item:       ${cred_name}"
+  fi
+  echo "Fields:"
+
+  local field_keys
+  field_keys=$(_cfg ".credentials.${cred_name}.fields | keys | .[]")
   while IFS= read -r var_name; do
     [[ -z "$var_name" ]] && continue
-    local ref
-    ref=$(_yq ".${tool_name}.environment.${var_name}" "$PCM_TOOLS")
+    local field_name ref
+    field_name=$(_cfg ".credentials.${cred_name}.fields.${var_name}")
+    if [[ -n "$prefix" ]]; then
+      ref="${prefix}${_PCM_SETTINGS_SEPARATOR}${cred_name}/${field_name}"
+    else
+      ref="${cred_name}/${field_name}"
+    fi
     echo "  ${var_name} <- ${ref}"
-  done <<< "$env_keys"
+  done <<< "$field_keys"
+}
+
+# ---------------------------------------------------------------------------
+# pcm config (diagnostic)
+# ---------------------------------------------------------------------------
+
+cmd_config() {
+  echo "Effective configuration:"
+  echo ""
+  echo "Sources (merge order):"
+
+  # Show global conf.d
+  if [[ -d "$PCM_CONF_DIR" ]]; then
+    for f in "$PCM_CONF_DIR"/*.yml; do
+      [[ -f "$f" ]] && echo "  $f"
+    done
+  fi
+
+  # Show legacy files if present
+  [[ -f "${HOME}/.config/pcm/vaults.yml" ]] && echo "  ${HOME}/.config/pcm/vaults.yml (legacy)"
+  [[ -f "${HOME}/.config/pcm/tools.yml" ]] && echo "  ${HOME}/.config/pcm/tools.yml (legacy)"
+
+  # Show walked-up .pcm.yml / pcm.yml files
+  local dir="$PWD"
+  local -a pcm_files=()
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "${dir}/.pcm.yml" ]]; then
+      pcm_files+=("${dir}/.pcm.yml")
+    elif [[ -f "${dir}/pcm.yml" ]]; then
+      pcm_files+=("${dir}/pcm.yml")
+    fi
+    dir="$(dirname "$dir")"
+  done
+  for (( i=${#pcm_files[@]}-1; i>=0; i-- )); do
+    echo "  ${pcm_files[$i]}"
+  done
+
+  echo ""
+  echo "Resolved values:"
+  echo "  backend:    ${PCM_DEFAULT_BACKEND}"
+  _show_role "workspace"   "${PCM_VAULT_ROLE_WORKSPACE:-}"    "PCM_VAULT_ROLE_WORKSPACE"
+  _show_role "personal"    "${PCM_VAULT_ROLE_PERSONAL:-}"     "PCM_VAULT_ROLE_PERSONAL"
+  _show_role "credentials" "${PCM_VAULT_ROLE_CREDENTIALS:-}"  "PCM_VAULT_ROLE_CREDENTIALS"
+
+  if [[ -n "$_PCM_SETTINGS_PREFIX" ]]; then
+    local prefix
+    prefix=$(_resolve_prefix 2>/dev/null) || prefix="(unresolvable)"
+    echo "  prefix:     ${_PCM_SETTINGS_PREFIX} → ${prefix}"
+    echo "  separator:  ${_PCM_SETTINGS_SEPARATOR}"
+  fi
+
+  local cred_count
+  cred_count=$(_cfg '.credentials | length')
+  echo "  credentials: ${cred_count:-0} configured"
 }
 
 # ---------------------------------------------------------------------------
@@ -717,22 +951,23 @@ Usage: pcm [--debug] <command> [args...]
 
 Commands:
   get [flags] <ref> [VAR]       Read a single credential (ref = item/field)
-  get <tool>                    Read all credentials for a tool (from tools.yml)
+  get <credential>              Read all fields for a credential (from .pcm.yml)
     -w                            from workspace vault
     -p                            from personal vault
     -c                            from credentials vault
     --from <vault>                from a named vault
   vault                         Vault management (list, show, create)
+  credentials                   Credential configuration (list, show)
+  config                        Show effective configuration
   list                          List items in workspace vault (JSON)
   token                         SA token management (get, clear, list)
-  tools                         Tool wrapper configuration (list, show)
   remote-env                    Output backend-specific env exports for remote hosts
   update                        Update pcm (git pull)
   help                          Show this help
 
-Configuration:
-  ~/.config/pcm/vaults.yml        Vault backends, roles, and registry
-  ~/.config/pcm/tools.yml         Tool wrapper credential mappings
+Configuration (unified .pcm.yml schema, merged in order):
+  ~/.config/pcm/conf.d/*.yml      Global config fragments
+  .pcm.yml                        Project/space-local (walked up from $PWD)
 
 Env var overrides:
   PCM_VAULT_ROLE_WORKSPACE    Override workspace vault role
@@ -748,23 +983,23 @@ EOF
 # Main dispatch
 # ---------------------------------------------------------------------------
 
-if [[ "${1:-}" == "--debug" ]]; then
-  PCM_DEBUG=1
-  shift
-fi
+# Use pre-parsed args (--debug already consumed at top)
+set -- "${_PCM_ARGS[@]}"
 
 command="${1:-help}"
 shift 2>/dev/null || true
 
 case "$command" in
-  get)        cmd_get "$@" ;;
-  vault)      cmd_vault "$@" ;;
-  list)       cmd_list ;;
-  token)      cmd_token "$@" ;;
-  tools)      cmd_tools "$@" ;;
-  remote-env) cmd_remote_env ;;
-  update)     cmd_update ;;
-  help)       cmd_help ;;
+  get)         cmd_get "$@" ;;
+  vault)       cmd_vault "$@" ;;
+  credentials) cmd_credentials "$@" ;;
+  tools)       cmd_credentials "$@" ;;  # backward compat alias
+  config)      cmd_config ;;
+  list)        cmd_list ;;
+  token)       cmd_token "$@" ;;
+  remote-env)  cmd_remote_env ;;
+  update)      cmd_update ;;
+  help)        cmd_help ;;
   *)
     _error "Unknown command: $command"
     cmd_help
