@@ -11,10 +11,10 @@ PCM ships with a 1Password backend. Adding Bitwarden, KeePass, or any other back
 curl -fsSL https://raw.githubusercontent.com/rjayroach/pcm/main/install.sh | bash
 
 # Read a credential from your workspace vault
-pcm get unifi/credential
+pcm credential get unifi/credential
 
 # Read all fields for a configured credential
-eval $(pcm get aws)
+eval $(pcm credential get aws)
 
 # Show effective config for current directory
 pcm config
@@ -25,25 +25,25 @@ pcm config
 PCM resolves credentials through three layers:
 
 1. **Vaults** — where credentials are stored (1Password vaults, Bitwarden collections, etc.)
-2. **Roles** — named references to vaults (`workspace`, `personal`, `credentials`) that decouple your commands from specific vault names
+2. **Providers** — named references to vaults (`workspace`, `user`, `accounts`) that decouple your commands from specific vault names
 3. **Credentials** — named mappings that connect environment variables to vault item fields
 
 ```
-pcm get unifi/credential
-     │         │
-     │         └── field name in the vault item
-     └── item name (or credential name from config)
+pcm credential get unifi/credential
+                    │         │
+                    │         └── field name in the vault item
+                    └── item name (or credential name from config)
 
      ┌─────────────────────────────┐
      │  .pcm.yml (credentials)     │
-     │  unifi → vault: workspace   │
+     │  unifi → provider: workspace│
      │          fields:            │
-     │            UNIFI_API_KEY:   │
-     │              credential     │
+     │            credential:      │
+     │              env: UNIFI_..  │
      └──────────┬──────────────────┘
                 │
      ┌──────────▼──────────────────┐
-     │  roles                      │
+     │  providers                  │
      │  workspace → rjayroach      │
      └──────────┬──────────────────┘
                 │
@@ -62,8 +62,9 @@ PCM uses a single YAML schema (`.pcm.yml` or `pcm.yml`) that can appear anywhere
 
 Config is merged in this order (later wins for same keys):
 
-1. **`~/.config/pcm/conf.d/*.yml`** — global fragments, loaded alphabetically
-2. **`.pcm.yml` / `pcm.yml` walked up from `$PWD`** — outermost directory first, innermost (closest to `$PWD`) last
+1. **`~/.config/pcm/pcm.yml`** — primary global config
+2. **`~/.config/pcm/conf.d/*.yml`** — optional global fragments, loaded alphabetically
+3. **`.pcm.yml` / `pcm.yml` walked up from `$PWD`** — outermost directory first, innermost (closest to `$PWD`) last
 
 Both `.pcm.yml` (hidden) and `pcm.yml` (visible) are supported in every directory, like mise. If both exist in the same directory, the hidden file takes precedence.
 
@@ -74,18 +75,17 @@ Every config file uses the same format. Include only the keys you need:
 ```yaml
 # Any .pcm.yml can contain any combination of these top-level keys
 
-defaults:
-  backend: op                    # default backend for all vaults
+backend: op                      # default backend for all vaults
 
 vaults:                          # vault registry
   my-vault:
   another-vault:
     backend: bw                  # per-vault backend override
 
-roles:                           # named vault references
+providers:                       # named vault references
   workspace: my-vault            # the "current context" vault
-  personal: my-vault             # identity-level credentials
-  credentials: another-vault     # where SA tokens are stored
+  user: my-vault                 # identity-level credentials
+  accounts: another-vault        # where SA tokens are stored
 
 settings:
   prefix: ${PCM_SITE}            # item name prefix (env var template)
@@ -93,49 +93,51 @@ settings:
 
 credentials:
   gh:
-    vault: personal
+    provider: user
     fields:
-      GH_TOKEN: token
+      token:
+        env: GH_TOKEN
   aws:
-    vault: workspace
+    provider: workspace
     fields:
-      AWS_ACCESS_KEY_ID: access-key-id
-      AWS_SECRET_ACCESS_KEY: secret-access-key
+      access-key-id:
+        env: AWS_ACCESS_KEY_ID
+      secret-access-key:
+        env: AWS_SECRET_ACCESS_KEY
 ```
 
 ### Typical Setup
 
-Global fragments define vaults, roles, and always-available credentials:
+The primary global config defines vaults, providers, and always-available credentials:
 
 ```
-~/.config/pcm/conf.d/
-├── vaults.yml          # vault registry + roles + backend
-├── gh.yml              # credentials.gh (vault: personal)
-└── aws.yml             # credentials.aws (vault: workspace)
+~/.config/pcm/
+├── pcm.yml              # backend, vaults, providers, global credentials
+└── conf.d/              # optional fragments (split by concern)
 ```
 
 Project-local files add context-specific credentials and settings:
 
 ```
 ~/spaces/myorg/
-├── .pcm.yml            # roles.workspace: myorg
+├── .pcm.yml            # providers.workspace: myorg
 └── infra/
     ├── .pcm.yml        # settings.prefix: ${PCM_SITE}
     └── unifi/
         └── .pcm.yml    # credentials.unifi, credentials.wifi
 ```
 
-When you `cd` into `infra/unifi/`, PCM merges everything: vaults and roles from global, prefix from infra, credentials from unifi.
+When you `cd` into `infra/unifi/`, PCM merges everything: vaults and providers from global, prefix from infra, credentials from unifi.
 
 ### Environment Variable Overrides
 
-Vault roles can be overridden by environment variables, which take precedence over config files:
+Providers can be overridden by environment variables, which take precedence over config files:
 
-| Role | Env var | Typical source |
-|------|---------|---------------|
-| workspace | `PCM_VAULT_ROLE_WORKSPACE` | mise (per-space `.mise.toml`) |
-| personal | `PCM_VAULT_ROLE_PERSONAL` | global config |
-| credentials | `PCM_VAULT_ROLE_CREDENTIALS` | global config |
+| Provider | Env var | Typical source |
+|----------|---------|---------------|
+| workspace | `PCM_PROVIDER_WORKSPACE` | mise (per-space `.mise.toml`) |
+| user | `PCM_PROVIDER_USER` | global config |
+| accounts | `PCM_PROVIDER_ACCOUNTS` | global config |
 
 ## Prefix System
 
@@ -163,7 +165,7 @@ PCM_SITE=singapore
 
 - **If prefix is declared**, all referenced env vars must be set. PCM hard-fails with a clear error if any variable is unset. This prevents silent misresolution.
 - **If prefix is not declared**, item names are used as-is. Existing behavior is fully preserved.
-- **Prefix applies in both modes**: `pcm get unifi/credential` (single field) and `pcm get unifi` (all fields).
+- **Prefix applies in both modes**: `pcm credential get unifi/credential` (single field) and `pcm credential get unifi` (all fields).
 - **Compound prefixes are supported**: `${PCM_ORG}-${PCM_SITE}-${PCM_ENV}` works — any number of variables can be composed.
 - **Separator is configurable**: defaults to `-`. Set `settings.separator` to change it.
 
@@ -179,14 +181,17 @@ infra/.pcm.yml:
 infra/unifi/.pcm.yml:
   credentials:
     unifi:
-      vault: workspace
+      provider: workspace
       fields:
-        UNIFI_API_KEY: credential
-        UNIFI_API: hostname
+        credential:
+          env: UNIFI_API_KEY
+        hostname:
+          env: UNIFI_API
     wifi:
-      vault: workspace
+      provider: workspace
       fields:
-        TF_VAR_wifi_passphrase: password
+        password:
+          env: TF_VAR_wifi_passphrase
 ```
 
 1Password items in the workspace vault:
@@ -201,8 +206,8 @@ infra/unifi/.pcm.yml:
 Usage:
 
 ```bash
-PCM_SITE=singapore pcm get unifi/credential   # reads singapore-unifi/credential
-PCM_SITE=rochester pcm get wifi/password       # reads rochester-wifi/password
+PCM_SITE=singapore pcm credential get unifi/credential   # reads singapore-unifi/credential
+PCM_SITE=rochester pcm credential get wifi/password       # reads rochester-wifi/password
 ```
 
 ### Scaling to Multiple WLANs
@@ -212,65 +217,74 @@ If a site has multiple WiFi networks, use credential names that include the SSID
 ```yaml
 credentials:
   wifi-iot:
-    vault: workspace
+    provider: workspace
     fields:
-      TF_VAR_wifi_iot_passphrase: password
+      password:
+        env: TF_VAR_wifi_iot_passphrase
   wifi-guest:
-    vault: workspace
+    provider: workspace
     fields:
-      TF_VAR_wifi_guest_passphrase: password
+      password:
+        env: TF_VAR_wifi_guest_passphrase
 ```
 
 Items become `singapore-wifi-iot`, `singapore-wifi-guest`. No new features needed — the credential name is arbitrary.
 
 ## CLI Reference
 
-### pcm get
+### pcm credential
 
-Read credentials from a vault.
-
-```bash
-# Single field (ref mode)
-pcm get unifi/credential              # from workspace vault
-pcm get -p github/token               # from personal vault
-pcm get --from my-vault db/password   # from a named vault
-
-# Single field with export
-pcm get -p github/token GH_TOKEN      # outputs: export GH_TOKEN='...'
-
-# All fields for a credential (credential mode)
-pcm get gh                            # outputs export lines for all fields
-eval $(pcm get aws)                   # load into shell
-```
-
-If the item name in a ref matches a configured credential, the prefix and vault from config are applied automatically. Unknown refs pass through as-is.
-
-**Vault flags** (ref mode only — credential mode uses the configured vault):
-
-| Flag | Vault |
-|------|-------|
-| `-w` (default) | workspace |
-| `-p` | personal |
-| `-c` | credentials |
-| `--from <name>` | named vault or role |
-
-### pcm credentials
-
-Inspect credential configuration.
+Credential operations (project-scoped).
 
 ```bash
-pcm credentials list              # list all configured credentials
-pcm credentials show unifi        # show details for a credential
+# List configured credentials
+pcm credential list
+
+# Show config details for a credential
+pcm credential show unifi
+
+# Fetch a single field value
+pcm credential get unifi/credential
+
+# Fetch all fields for a credential (export lines)
+pcm credential get gh
+eval $(pcm credential get aws)
+
+# Validate credentials exist in the backend
+pcm credential validate
+pcm credential validate --fix        # provision missing items
+pcm credential validate --fix -y     # skip confirmation
 ```
 
 ### pcm vault
 
-Manage vaults.
+Vault operations (backend-scoped).
 
 ```bash
-pcm vault list                    # show vault roles
-pcm vault show workspace          # show details for a vault
+pcm vault list                    # list vaults from the backend (JSON)
+pcm vault show rjayroach          # show details for a vault
 pcm vault create my-vault         # create vault + service account + store token
+```
+
+### pcm plugin
+
+Plugin operations (registry-scoped).
+
+```bash
+pcm plugin list                   # list available plugins in the registry
+pcm plugin list --installed       # list plugins installed in current project
+pcm plugin show unifi             # show plugin details
+pcm plugin add unifi              # apply a plugin to the current directory
+```
+
+### pcm cache
+
+SA token cache management (local device, macOS Keychain).
+
+```bash
+pcm cache list                    # list cached SA tokens
+pcm cache show                    # show/cache SA token for workspace vault
+pcm cache clear                   # clear cached token
 ```
 
 ### pcm config
@@ -278,30 +292,39 @@ pcm vault create my-vault         # create vault + service account + store token
 Show the effective merged configuration for the current directory.
 
 ```bash
-pcm config                        # shows sources, roles, prefix, credential count
-```
-
-### pcm token
-
-Manage service account tokens (macOS Keychain cached).
-
-```bash
-pcm token                         # get SA token for workspace vault
-pcm token clear                   # clear cached token
-pcm token list                    # list cached tokens
+pcm config                        # shows sources, providers, prefix, credential count
 ```
 
 ### Other Commands
 
 ```bash
-pcm list                          # list items in workspace vault (JSON)
-pcm remote-env                    # output env exports for remote SSH hosts
 pcm ssh <host>                    # SSH with credential forwarding (via pcm.zsh)
-pcm update                        # git pull the repo
+pcm update                        # git pull the repo + plugin registry
 pcm help                          # show help
 ```
 
 All commands support `--debug` as the first argument for verbose output.
+
+## Plugins
+
+PCM plugins are installable workflow kits that bundle credential definitions, env schemas, and task automation for a specific tool or use case. Plugins live in a separate registry repo.
+
+```bash
+# Browse available plugins
+pcm plugin list
+
+# Show what a plugin provides
+pcm plugin show unifi
+
+# Apply a plugin to the current directory (composable)
+cd existing-project
+pcm plugin add aws
+pcm plugin add unifi
+```
+
+`pcm plugin add` merges credential definitions into `.pcm.yml`, copies template files based on tool detection (varlock schemas if varlock is installed, mise tasks if mise is installed), and tracks which plugins have been applied.
+
+Plugins are cached at `~/.cache/pcm/registry/` and refreshed by `pcm update`.
 
 ## Integration with Varlock
 
@@ -315,10 +338,10 @@ PCM pairs with [varlock](https://github.com/dmno-dev/varlock) for environment va
 PCM_SITE=
 
 # @type=string @sensitive
-UNIFI_API_KEY=exec(`pcm get unifi/credential`)
+UNIFI_API_KEY=exec(`pcm credential get unifi/credential`)
 
 # @type=url @sensitive=false
-UNIFI_API=exec(`pcm get unifi/hostname`)
+UNIFI_API=exec(`pcm credential get unifi/hostname`)
 ```
 
 ```bash
@@ -328,12 +351,12 @@ PCM_SITE=singapore varlock run -- tofu plan  # inject and run
 
 ## Integration with Mise
 
-PCM's workspace role is typically set by [mise](https://mise.jdx.dev) based on directory context:
+PCM's workspace provider is typically set by [mise](https://mise.jdx.dev) based on directory context:
 
 ```toml
 # ~/spaces/myorg/.mise.toml
 [env]
-PCM_VAULT_ROLE_WORKSPACE = "myorg"
+PCM_PROVIDER_WORKSPACE = "myorg"
 ```
 
 Mise tasks can pass site context to PCM via varlock:
@@ -362,6 +385,7 @@ Create `lib/<name>.sh` implementing:
 ```bash
 _pcm_read <vault> <ref>                          # read a secret value
 _pcm_list <vault>                                # list items (JSON)
+_pcm_list_vaults                                 # list all vaults (JSON)
 _pcm_vault_exists <name>                         # check if vault exists
 _pcm_vault_info <name>                           # get vault details (JSON)
 _pcm_create_vault <name>                         # create a vault
@@ -374,12 +398,11 @@ _pcm_remote_env <vault> <credentials_vault>      # output env exports for SSH
 Set the backend globally or per-vault:
 
 ```yaml
-defaults:
-  backend: op          # global default
+backend: op              # global default
 
 vaults:
   my-bw-vault:
-    backend: bw        # this vault uses Bitwarden
+    backend: bw          # this vault uses Bitwarden
 ```
 
 ### 1Password Backend (op.sh)
@@ -410,6 +433,6 @@ Custom fields work with any item type. The `op read` ref is always `vault/item/f
 - **Backend-agnostic** — PCM delegates all operations to backend plugins. Adding a backend = dropping a shell script.
 - **Config is optional** — env vars can drive everything. Config files provide defaults and structure.
 - **Merge, don't mandate** — any `.pcm.yml` can contain any config key. Split by concern or combine — your choice.
-- **Vault roles over vault names** — commands reference roles which resolve to names. Switch context by changing one env var.
+- **Providers over vault names** — commands reference providers which resolve to vault names. Switch context by changing one env var.
 - **Prefix for multi-tenancy** — one credential definition works across sites, environments, or tenants via templated prefixes.
 - **Zero runtime dependencies** — beyond `yq`, `jq`, and your backend CLI. No gems, no npm, no containers.
