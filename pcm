@@ -1412,14 +1412,14 @@ cmd_config() {
 }
 
 # ---------------------------------------------------------------------------
-# pcm completions
+# pcm completion
 # ---------------------------------------------------------------------------
 
-cmd_completions() {
+cmd_completion() {
   local shell="${1:-}"
   case "$shell" in
     zsh)
-      local comp_file="${PCM_HOME}/lib/completions.zsh"
+      local comp_file="${PCM_HOME}/lib/completion.zsh"
       if [[ ! -f "$comp_file" ]]; then
         _error "Completion file not found: $comp_file"
         exit 1
@@ -1427,7 +1427,7 @@ cmd_completions() {
       cat "$comp_file"
       ;;
     "")
-      _error "Usage: pcm completions <shell>"
+      _error "Usage: pcm completion <shell>"
       _error "Supported: zsh"
       exit 1
       ;;
@@ -1556,7 +1556,7 @@ case "$command" in
   update)       cmd_update ;;
   help)         cmd_help ;;
   # Hidden commands (functional but not advertised)
-  completions)  cmd_completions "$@" ;;
+  completion)   cmd_completion "$@" ;;
   remote-env)   cmd_remote_env ;;
   *)
     _error "Unknown command: $command"
